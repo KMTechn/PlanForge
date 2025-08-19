@@ -40,7 +40,7 @@ from queue import Queue, Empty
 #        - 장기 예측 (Long-Term): 더 긴 미래(예: 7일)의 총생산량을 함께 예측하여, 갑작스러운 생산량 폭증에 대비한 선제적 납품 물량을 계산한다.
 #        - 최종 결정: 단기/장기 예측 중 더 많은 수량을 요구하는 쪽을 기준으로 당일 필요량을 결정하여, 미래의 결품 위기를 사전에 방지한다.
 #
-#    - 부족분 이월 및 해소 (Deficit Carry-over): 만약 하루 최대 출고 용량(Capacity)을 초과하여 보내지 못한 물량이 발생하면, 이를 '배송 부족분'으로 기록하여 다음 납품 가능일에 최우선으로 반영하여 해소한다.
+#    - 계획 건전성 검사 (Plan Health Check): 필수 출고량을 당일 운송 용량 내에서 해결할 수 없는 경우, 이를 '계획 실패'로 간주하고 사용자에게 명확히 경고한다.
 # -----------------------------------------
 
 # ===================================================================
@@ -48,7 +48,7 @@ from queue import Queue, Empty
 # ===================================================================
 REPO_OWNER = "Your-GitHub-Username"
 REPO_NAME = "PlanForge-Repository-Name"
-CURRENT_VERSION = "v2.3.1" # 버전 업데이트
+CURRENT_VERSION = "v2.5.0" # 버전 업데이트
 # ===================================================================
 
 # 자동 업데이트 기능 함수
@@ -237,10 +237,11 @@ class PlanProcessor:
         self.inventory_date = None
         self.adjustments = []
         self.fixed_shipments = []
-        self.fixed_shipment_reqs = [] # '고정 출고' 타입 조정을 저장
+        self.fixed_shipment_reqs = []
         self.item_master_df = None
         self.allowed_models = []
         self.highlight_models = []
+        self.unmet_demand_log = [] # '계획 실패' 경고를 위한 로그
         self._load_item_master()
 
     def _load_item_master(self):
@@ -390,6 +391,8 @@ class PlanProcessor:
         self.adjustments = adjustments if adjustments else []
         self.fixed_shipments = fixed_shipments if fixed_shipments else []
         self.fixed_shipment_reqs = fixed_shipment_reqs if fixed_shipment_reqs else []
+        self.unmet_demand_log = [] # 시뮬레이션 시작 시 로그 초기화
+
         if self.aggregated_plan_df is None: return
 
         plan_df = self.aggregated_plan_df.copy()
@@ -412,7 +415,6 @@ class PlanProcessor:
         truck_capacity = pallets_per_truck * pallet_size
         safety_stock = self.item_master_df['SafetyStock']
 
-        # '재고', '수요' 조정 적용
         for adj in self.adjustments:
             adj_date_dt = pd.to_datetime(adj['date'])
             if adj['model'] in plan_df.index and adj_date_dt in plan_df.columns:
@@ -428,83 +430,94 @@ class PlanProcessor:
         shipments_by_truck = {}
         current_inventory = plan_df['Inventory'].copy().astype(np.int64)
         
-        shipping_deficit = pd.Series(0, index=plan_df.index, dtype=np.int64)
-
         for date in simulation_dates:
             daily_max_trucks = self.config.get('DAILY_TRUCK_OVERRIDES', {}).get(date.date(), self.config.get('MAX_TRUCKS_PER_DAY', 2))
-            
             production_today = demand_df[date]
-            
             is_shipping_day = self.config['DELIVERY_DAYS'].get(str(date.weekday()), 'False') == 'True'
             is_non_shipping_date = date.date() in self.config['NON_SHIPPING_DATES']
-            
             total_shipments_today = pd.Series(0, index=plan_df.index, dtype=np.int64)
 
             if is_shipping_day and not is_non_shipping_date:
-                # 1. 재고 기반 필요량 계산 (기존 로직)
+                # TIER 1: 필수 출고량 (Must-Ship)
                 required_for_lead_time = rolling_demand[date] - current_inventory + safety_stock
-                future_lookahead_days = 7
-                end_window = date + pd.Timedelta(days=future_lookahead_days)
-                future_dates = [d for d in simulation_dates if date <= d < end_window]
-                required_for_future = demand_df[future_dates].sum(axis=1) - current_inventory + safety_stock
-                required_from_inv = pd.concat([required_for_lead_time, required_for_future], axis=1).max(axis=1)
+                short_term_days = 7
+                end_short_term = date + pd.Timedelta(days=short_term_days)
+                short_term_dates = [d for d in simulation_dates if date <= d < end_short_term]
+                required_for_short_term = demand_df[short_term_dates].sum(axis=1) - current_inventory + safety_stock
+                must_ship_demand = pd.concat([required_for_lead_time, required_for_short_term], axis=1).max(axis=1)
+                must_ship_demand[must_ship_demand < 0] = 0
 
-                # 2. '고정 출고' 조정분 반영
+                # TIER 2: 선제적 출고 가능량 (Pull-Forward)
+                long_term_days = 30
+                end_long_term = date + pd.Timedelta(days=long_term_days)
+                long_term_dates = [d for d in simulation_dates if end_short_term <= d < end_long_term]
+                pull_forward_demand = demand_df[long_term_dates].sum(axis=1) if long_term_dates else pd.Series(0, index=plan_df.index)
+
                 fixed_reqs_today = pd.Series(0, index=plan_df.index, dtype=np.int64)
                 for req in [r for r in self.fixed_shipment_reqs if r['date'] == date.date()]:
                     if req['model'] in fixed_reqs_today.index:
                         fixed_reqs_today.loc[req['model']] += req['qty']
-
-                # 3. 최종 필요량 결정: max(재고 기반 필요량, 고정 출고량)
-                required = pd.concat([required_from_inv, fixed_reqs_today], axis=1).max(axis=1)
                 
-                required = required + shipping_deficit 
-                required[required < 0] = 0
-                required = required.astype(np.int64)
+                must_ship_demand = pd.concat([must_ship_demand, fixed_reqs_today], axis=1).max(axis=1).astype(np.int64)
 
-                # --- 이하 출고 로직은 동일 ---
+                # 트럭 적재 로직
                 fixed_shipments_today = pd.DataFrame(0, index=plan_df.index, columns=range(1, daily_max_trucks + 1), dtype=np.int64)
                 truck_capacity_remains = pd.Series(truck_capacity, index=range(1, daily_max_trucks + 1), dtype=np.int64)
                 
                 for fixed in [s for s in self.fixed_shipments if s['date'] == date.date()]:
                     if fixed['truck_num'] <= daily_max_trucks:
-                        qty = fixed['qty']
-                        fixed_shipments_today.loc[fixed['model'], fixed['truck_num']] = qty
-                        truck_capacity_remains[fixed['truck_num']] -= qty
+                        fixed_shipments_today.loc[fixed['model'], fixed['truck_num']] = fixed['qty']
+                        truck_capacity_remains[fixed['truck_num']] -= fixed['qty']
                 
-                remaining_required = required - fixed_shipments_today.sum(axis=1)
-                remaining_required[remaining_required < 0] = 0
+                remaining_must_ship = (must_ship_demand - fixed_shipments_today.sum(axis=1)).clip(lower=0)
+                shipped_against_must = fixed_shipments_today.sum(axis=1).clip(upper=must_ship_demand)
+                shipped_against_pull = (fixed_shipments_today.sum(axis=1) - shipped_against_must)
+                remaining_pull_forward = (pull_forward_demand - shipped_against_pull).clip(lower=0)
 
                 priority_models = self.item_master_df.sort_values('Priority').index
                 auto_shipments_today = pd.DataFrame(0, index=plan_df.index, columns=range(1, daily_max_trucks + 1), dtype=np.int64)
                 
-                for model in priority_models:
-                    if remaining_required.loc[model] > 0:
-                        needed = remaining_required.loc[model]
-                        for truck_num in range(1, daily_max_trucks + 1):
-                            if needed <= 0: break
-                            if truck_capacity_remains[truck_num] > 0:
-                                shipment_pallets = math.ceil(needed / pallet_size)
-                                shipment_qty = min(shipment_pallets * pallet_size, truck_capacity_remains[truck_num])
-                                
-                                auto_shipments_today.loc[model, truck_num] += shipment_qty
-                                truck_capacity_remains[truck_num] -= shipment_qty
-                                needed -= shipment_qty
-                
+                for truck_num in range(1, daily_max_trucks + 1):
+                    if truck_capacity_remains[truck_num] <= 0: continue
+
+                    for model in priority_models:
+                        if truck_capacity_remains[truck_num] < pallet_size: break
+                        if remaining_must_ship.loc[model] > 0:
+                            pallets_needed = math.ceil(remaining_must_ship.loc[model] / pallet_size)
+                            max_pallets_in_truck = math.floor(truck_capacity_remains[truck_num] / pallet_size)
+                            pallets_to_ship = min(pallets_needed, max_pallets_in_truck)
+                            if pallets_to_ship > 0:
+                                qty_to_ship = pallets_to_ship * pallet_size
+                                auto_shipments_today.loc[model, truck_num] += qty_to_ship
+                                truck_capacity_remains[truck_num] -= qty_to_ship
+                                remaining_must_ship.loc[model] -= qty_to_ship
+                    
+                    for model in priority_models:
+                        if truck_capacity_remains[truck_num] < pallet_size: break
+                        if remaining_pull_forward.loc[model] > 0:
+                            pallets_can_ship = math.floor(remaining_pull_forward.loc[model] / pallet_size)
+                            max_pallets_in_truck = math.floor(truck_capacity_remains[truck_num] / pallet_size)
+                            pallets_to_ship = min(pallets_can_ship, max_pallets_in_truck)
+                            if pallets_to_ship > 0:
+                                qty_to_ship = pallets_to_ship * pallet_size
+                                auto_shipments_today.loc[model, truck_num] += qty_to_ship
+                                truck_capacity_remains[truck_num] -= qty_to_ship
+                                remaining_pull_forward.loc[model] -= qty_to_ship
+
                 final_daily_shipments = fixed_shipments_today + auto_shipments_today
                 total_shipments_today = final_daily_shipments.sum(axis=1)
-
-                shipping_deficit = required - total_shipments_today
-                shipping_deficit[shipping_deficit < 0] = 0
 
                 for truck_num in range(1, daily_max_trucks + 1):
                     if truck_num not in shipments_by_truck:
                         shipments_by_truck[truck_num] = pd.DataFrame(0, index=plan_df.index, columns=simulation_dates, dtype=np.int64)
                     shipments_by_truck[truck_num][date] = final_daily_shipments[truck_num]
-            else:
-                 required_for_lead_time = rolling_demand[date] - current_inventory + safety_stock
-                 required_for_lead_time[required_for_lead_time < 0] = 0
-                 shipping_deficit += required_for_lead_time
+                
+                unmet_demand = (must_ship_demand - total_shipments_today).clip(lower=0)
+                if unmet_demand.sum() > 0:
+                    for model, qty in unmet_demand[unmet_demand > 0].items():
+                        log_entry = {'date': date.date(), 'model': model, 'unmet_qty': int(qty)}
+                        self.unmet_demand_log.append(log_entry)
+                        logging.warning(f"계획 실패: {log_entry}")
 
             current_inventory = current_inventory + total_shipments_today - production_today
             inventory_over_time[date] = current_inventory
@@ -522,7 +535,7 @@ class PlanProcessor:
                     result_df[col_name] = 0
 
         self.simulated_plan_df = result_df.fillna(0).astype(int)
-        logging.info("개선된 시뮬레이션 완료.")
+        logging.info("시뮬레이션 완료.")
 
     def find_and_propose_fix(self, max_truck_limit=3):
         if self.simulated_plan_df is None:
@@ -1156,7 +1169,7 @@ class ProductionPlannerApp(ctk.CTk):
         main_area_frame = ctk.CTkFrame(main_content_container, fg_color="transparent")
         main_area_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         main_area_frame.grid_columnconfigure(0, weight=1)
-        main_area_frame.grid_rowconfigure(2, weight=1)
+        main_area_frame.grid_rowconfigure(3, weight=1) # Row index changed for new frame
 
         self.sidebar_title = ctk.CTkLabel(self.sidebar_frame, text="PlanForge Pro", font=self.font_big_bold)
         self.sidebar_title.pack(pady=20)
@@ -1169,7 +1182,6 @@ class ProductionPlannerApp(ctk.CTk):
         self.step4_button = ctk.CTkButton(self.sidebar_frame, text="4. 계획 내보내기 (Excel)", command=self.export_to_excel, state="disabled", font=self.font_normal)
         self.step4_button.pack(fill='x', padx=20, pady=5)
         
-        # 재고 안정화 버튼 추가
         self.stabilize_button = ctk.CTkButton(self.sidebar_frame, text="✨ 재고 안정화 실행", command=self.run_stabilization, state="disabled", font=self.font_normal, fg_color="#0B5345", hover_color="#117A65")
         self.stabilize_button.pack(fill='x', padx=20, pady=(15, 5))
 
@@ -1214,11 +1226,7 @@ class ProductionPlannerApp(ctk.CTk):
         for i, day in enumerate(day_names):
             state = self.config_manager.config.get('DELIVERY_DAYS', {}).get(str(i), 'False') == 'True'
             cb = ctk.CTkCheckBox(checkbox_container, text=day, onvalue=True, offvalue=False, font=self.font_normal, width=1)
-            
-            row = i // 4
-            col = i % 4
-            
-            cb.grid(row=row, column=col, padx=2, pady=1, sticky='w')
+            cb.grid(row=i // 4, column=i % 4, padx=2, pady=1, sticky='w')
             if state: cb.select()
             self.day_checkboxes[i] = cb
 
@@ -1254,16 +1262,25 @@ class ProductionPlannerApp(ctk.CTk):
         self.lbl_date_range = ctk.CTkLabel(self.kpi_frame, text="계획 기간: -", font=self.font_kpi)
         self.lbl_date_range.grid(row=0, column=2, padx=10, pady=10)
         
-        self.shortage_frame = ctk.CTkFrame(main_area_frame, fg_color="#FFF5E1")
-        self.shortage_frame.grid(row=1, column=0, sticky="ew", pady=5)
-        self.shortage_frame.grid_remove()
-        shortage_title = ctk.CTkLabel(self.shortage_frame, text="⚠️ 재고 부족 경고", font=self.font_bold, text_color="#E67E22")
-        shortage_title.pack(pady=(5,0))
-        self.shortage_list_frame = ctk.CTkScrollableFrame(self.shortage_frame, label_text="", height=100)
-        self.shortage_list_frame.pack(fill="x", expand=True, padx=5, pady=5)
+        # --- 경고 프레임 영역 수정 ---
+        self.unmet_demand_frame = ctk.CTkFrame(main_area_frame, fg_color="#FFDDE1")
+        self.unmet_demand_frame.grid(row=1, column=0, sticky="ew", pady=(5,0))
+        self.unmet_demand_frame.grid_remove()
+        unmet_title = ctk.CTkLabel(self.unmet_demand_frame, text="🚨 계획 실패 경고 (필수 출고량 부족)", font=self.font_bold, text_color="#C0392B")
+        unmet_title.pack(pady=(5,0))
+        self.unmet_list_frame = ctk.CTkScrollableFrame(self.unmet_demand_frame, label_text="", height=80)
+        self.unmet_list_frame.pack(fill="x", expand=True, padx=5, pady=5)
 
+        self.shortage_frame = ctk.CTkFrame(main_area_frame, fg_color="#FFF5E1")
+        self.shortage_frame.grid(row=2, column=0, sticky="ew", pady=5)
+        self.shortage_frame.grid_remove()
+        shortage_title = ctk.CTkLabel(self.shortage_frame, text="⚠️ 재고 부족 경고 (안전 재고 미달)", font=self.font_bold, text_color="#E67E22")
+        shortage_title.pack(pady=(5,0))
+        self.shortage_list_frame = ctk.CTkScrollableFrame(self.shortage_frame, label_text="", height=80)
+        self.shortage_list_frame.pack(fill="x", expand=True, padx=5, pady=5)
+        
         self.tabview = ctk.CTkTabview(main_area_frame)
-        self.tabview.grid(row=2, column=0, sticky="nsew")
+        self.tabview.grid(row=3, column=0, sticky="nsew") # Row index changed
         self.master_tab = self.tabview.add("개요")
         self.detail_tab = self.tabview.add("상세")
         self.master_tab.grid_columnconfigure(0, weight=1)
@@ -1310,11 +1327,7 @@ class ProductionPlannerApp(ctk.CTk):
                     return
                 plan_cols = self.processor.date_cols
                 df_filtered = df[df[plan_cols].sum(axis=1) > 0]
-                result = {
-                    "models_found": len(df_filtered.index),
-                    "total_qty": df_filtered[plan_cols].sum().sum(),
-                    "date_range": f"{plan_cols[0].strftime('%y/%m/%d')} ~ {plan_cols[-1].strftime('%y/%m/%d')}"
-                }
+                result = { "models_found": len(df_filtered.index), "total_qty": df_filtered[plan_cols].sum().sum(), "date_range": f"{plan_cols[0].strftime('%y/%m/%d')} ~ {plan_cols[-1].strftime('%y/%m/%d')}" }
                 self.thread_queue.put(("update_ui_step1", result))
             except Exception as e:
                 self.thread_queue.put(("error", f"1단계 파일 처리 실패: {e}"))
@@ -1329,6 +1342,7 @@ class ProductionPlannerApp(ctk.CTk):
         self.filter_grid()
         self.update_status_bar("1단계: 생산계획 집계 완료")
         self.shortage_frame.grid_remove()
+        self.unmet_demand_frame.grid_remove()
         logging.info("1단계 완료. UI 업데이트 완료.")
 
     def run_step2_simulation(self):
@@ -1346,11 +1360,7 @@ class ProductionPlannerApp(ctk.CTk):
                 elif source_type == 'file':
                     self.processor.load_inventory_from_file(param)
                     self.inventory_text_backup = None
-                self.processor.run_simulation(
-                    adjustments=self.processor.adjustments, 
-                    fixed_shipments=self.processor.fixed_shipments,
-                    fixed_shipment_reqs=self.processor.fixed_shipment_reqs
-                )
+                self.processor.run_simulation(adjustments=self.processor.adjustments, fixed_shipments=self.processor.fixed_shipments, fixed_shipment_reqs=self.processor.fixed_shipment_reqs)
                 if self.processor.simulated_plan_df is None:
                     self.thread_queue.put(("error", "시뮬레이션 결과가 생성되지 않았습니다."))
                     return
@@ -1367,6 +1377,7 @@ class ProductionPlannerApp(ctk.CTk):
         self.filter_grid()
         self.update_status_bar("2단계: 출고 계획 시뮬레이션 완료.")
         self.check_shipment_capacity()
+        self.update_unmet_demand_warnings() # 계획 실패 경고 업데이트
         self.update_shortage_warnings()
         logging.info("2단계 완료. 시뮬레이션 결과 UI 업데이트 완료.")
 
@@ -1379,18 +1390,11 @@ class ProductionPlannerApp(ctk.CTk):
         
         def worker():
             try:
-                # 조정 사항들을 타입에 따라 분리
                 self.processor.adjustments = [adj for adj in all_adjustments if adj['type'] in ['재고', '수요']]
                 self.processor.fixed_shipment_reqs = [adj for adj in all_adjustments if adj['type'] == '고정 출고']
-
                 if self.inventory_text_backup:
                     self.processor.load_inventory_from_text(self.inventory_text_backup)
-
-                self.processor.run_simulation(
-                    adjustments=self.processor.adjustments,
-                    fixed_shipments=self.processor.fixed_shipments,
-                    fixed_shipment_reqs=self.processor.fixed_shipment_reqs
-                )
+                self.processor.run_simulation(adjustments=self.processor.adjustments, fixed_shipments=self.processor.fixed_shipments, fixed_shipment_reqs=self.processor.fixed_shipment_reqs)
                 total_ship = self.processor.simulated_plan_df[[c for c in self.processor.simulated_plan_df.columns if isinstance(c, str) and c.startswith('출고_')]].sum().sum()
                 self.thread_queue.put(("update_ui_step3", {"total_ship": total_ship}))
             except Exception as e:
@@ -1404,6 +1408,7 @@ class ProductionPlannerApp(ctk.CTk):
         self.filter_grid()
         self.update_status_bar("3단계: 수동 조정 적용 완료.")
         self.check_shipment_capacity()
+        self.update_unmet_demand_warnings() # 계획 실패 경고 업데이트
         self.update_shortage_warnings()
         logging.info("3단계 완료. 조정 결과 UI 업데이트 완료.")
     
@@ -1417,34 +1422,41 @@ class ProductionPlannerApp(ctk.CTk):
         
         def worker():
             try:
-                max_iterations = 30 # Safety break for complex cases
-                max_truck_limit_per_day = 3 # Hard limit for auto-stabilization
+                max_iterations = 30
+                max_truck_limit_per_day = 3
 
                 for i in range(max_iterations):
                     progress = int(((i + 1) / max_iterations) * 100)
                     self.status_bar.configure(text=f"재고 안정화 실행 중... ({progress}% 완료, {i+1}차 재계산)")
 
                     if self.inventory_text_backup: self.processor.load_inventory_from_text(self.inventory_text_backup)
-                    self.processor.run_simulation(
-                        adjustments=self.processor.adjustments, 
-                        fixed_shipments=self.processor.fixed_shipments,
-                        fixed_shipment_reqs=self.processor.fixed_shipment_reqs
-                        )
+                    self.processor.run_simulation(adjustments=self.processor.adjustments, fixed_shipments=self.processor.fixed_shipments, fixed_shipment_reqs=self.processor.fixed_shipment_reqs)
                     
+                    # 1순위: 계획 실패(필수 물량 부족) 해결
+                    if self.processor.unmet_demand_log:
+                        first_failure = self.processor.unmet_demand_log[0]
+                        shipping_date = first_failure['date']
+                        current_max = self.processor.config.get('DAILY_TRUCK_OVERRIDES', {}).get(shipping_date, self.processor.config.get('MAX_TRUCKS_PER_DAY'))
+                        if current_max >= max_truck_limit_per_day:
+                            self.thread_queue.put(("error", f"안정화 실패: {shipping_date}의 차수가 이미 최대({max_truck_limit_per_day}회)입니다."))
+                            return
+                        new_max = current_max + 1
+                        self.processor.config['DAILY_TRUCK_OVERRIDES'][shipping_date] = new_max
+                        logging.info(f"안정화 {i+1}단계: {shipping_date} 필수물량 부족 해결 위해 차수를 {new_max}로 증가")
+                        continue # 다음 루프에서 재시도
+                    
+                    # 2순위: 안전 재고 부족 해결
                     found_shortage, fix_info = self.processor.find_and_propose_fix(max_truck_limit=max_truck_limit_per_day)
-                    
                     if not found_shortage:
-                        if fix_info and "error" in fix_info:
-                             self.thread_queue.put(("error", f"최적화 중단: {fix_info['error']}"))
-                             return
-                        self.thread_queue.put(("recalculation_done", f"재고 안정화 완료! ({i}회 반복)"))
+                        msg = f"재고 안정화 완료! ({i}회 반복)" if i > 0 else "현재 계획은 안정적입니다."
+                        self.thread_queue.put(("recalculation_done", msg))
                         return
                     
                     shipping_date = fix_info['shipping_date']
                     current_max = self.processor.config.get('DAILY_TRUCK_OVERRIDES', {}).get(shipping_date, self.processor.config.get('MAX_TRUCKS_PER_DAY'))
                     new_max = current_max + 1
                     self.processor.config['DAILY_TRUCK_OVERRIDES'][shipping_date] = new_max
-                    logging.info(f"안정화 {i+1}단계: {fix_info['shortage_date']} 부족({fix_info['model']}) 해결 위해 {shipping_date} 차수를 {new_max}로 증가")
+                    logging.info(f"안정화 {i+1}단계: {fix_info['shortage_date']} 재고부족({fix_info['model']}) 해결 위해 {shipping_date} 차수를 {new_max}로 증가")
 
                 self.thread_queue.put(("error", f"최적화 실패: 최대 반복 횟수({max_iterations}회) 초과"))
 
@@ -1453,18 +1465,13 @@ class ProductionPlannerApp(ctk.CTk):
                 
         self.run_in_thread(worker)
 
-
     def recalculate_with_fixed_values(self):
         self.update_status_bar("고정값을 적용하여 재계산 중입니다...")
         def worker():
             try:
                 if self.inventory_text_backup:
                     self.processor.load_inventory_from_text(self.inventory_text_backup)
-                self.processor.run_simulation(
-                    adjustments=self.processor.adjustments, 
-                    fixed_shipments=self.processor.fixed_shipments,
-                    fixed_shipment_reqs=self.processor.fixed_shipment_reqs
-                )
+                self.processor.run_simulation(adjustments=self.processor.adjustments, fixed_shipments=self.processor.fixed_shipments, fixed_shipment_reqs=self.processor.fixed_shipment_reqs)
                 self.thread_queue.put(("recalculation_done", "재계산 완료"))
             except Exception as e:
                 self.thread_queue.put(("error", f"재계산 실패: {e}"))
@@ -1488,11 +1495,7 @@ class ProductionPlannerApp(ctk.CTk):
                 if self.current_step >= 1: self.processor.process_plan_file()
                 if self.current_step >= 2:
                     if self.inventory_text_backup: self.processor.load_inventory_from_text(self.inventory_text_backup)
-                    self.processor.run_simulation(
-                        adjustments=self.processor.adjustments, 
-                        fixed_shipments=self.processor.fixed_shipments,
-                        fixed_shipment_reqs=self.processor.fixed_shipment_reqs
-                    )
+                    self.processor.run_simulation(adjustments=self.processor.adjustments, fixed_shipments=self.processor.fixed_shipments, fixed_shipment_reqs=self.processor.fixed_shipment_reqs)
                 self.thread_queue.put(("recalculation_done", "설정 저장 및 재계산 완료"))
             except Exception as e:
                 self.thread_queue.put(("error", f"재계산 실패: {e}"))
@@ -1502,7 +1505,8 @@ class ProductionPlannerApp(ctk.CTk):
         self.filter_grid()
         if self.last_selected_model:
             self.populate_detail_view(self.last_selected_model)
-        self.update_shortage_warnings(propose_fix=False) # 재계산 후에는 경고만 표시
+        self.update_unmet_demand_warnings()
+        self.update_shortage_warnings(propose_fix=False)
         self.update_status_bar(message)
         messagebox.showinfo("성공", message)
         logging.info(message)
@@ -1511,18 +1515,11 @@ class ProductionPlannerApp(ctk.CTk):
         if self.current_step < 1:
             messagebox.showwarning("오류", "먼저 데이터를 불러와야 합니다.")
             return
-
         start_date = self.processor.date_cols[0].strftime('%m-%d')
         end_date = self.processor.date_cols[-1].strftime('%m-%d')
-        
-        if self.current_step == 1:
-            filename = f"{start_date}~{end_date} 생산계획.xlsx"
-        else:
-            filename = f"{start_date}~{end_date} 출고계획.xlsx"
-
+        filename = f"{start_date}~{end_date} {'생산계획' if self.current_step == 1 else '출고계획'}.xlsx"
         file_path = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile=filename, filetypes=(("Excel", "*.xlsx"),))
         if not file_path: return
-                
         self.update_status_bar(f"'{os.path.basename(file_path)}' 파일로 내보내는 중입니다...")
         
         def worker():
@@ -1537,14 +1534,13 @@ class ProductionPlannerApp(ctk.CTk):
                         shipment_cols = [c for c in df.columns if isinstance(c, str) and c.startswith('출고_')]
                         df_filtered = df[df[shipment_cols].sum(axis=1) > 0]
                         df_filtered.to_excel(writer, sheet_name='Full Plan')
-
                         all_truck_nums = sorted(list(set(int(c.split('_')[1][:-1]) for c in shipment_cols)))
                         for truck_num in all_truck_nums:
                             sheet_name = f'{truck_num}차 출고'
                             cols_for_truck = [f'출고_{truck_num}차_{d.strftime("%m%d")}' for d in self.processor.date_cols if f'출고_{truck_num}차_{d.strftime("%m%d")}' in df.columns]
                             if not cols_for_truck: continue
                             df_truck = df_filtered[cols_for_truck].copy()
-                            df_truck.columns = [c[-4:] for c in cols_for_truck] # MM-DD format
+                            df_truck.columns = [c[-4:] for c in cols_for_truck]
                             df_truck = df_truck.rename(columns=lambda x: f"{x[:2]}-{x[2:]}")
                             df_truck[df_truck.sum(axis=1) > 0].to_excel(writer, sheet_name=sheet_name)
                 self.thread_queue.put(("export_done", file_path))
@@ -1553,23 +1549,16 @@ class ProductionPlannerApp(ctk.CTk):
         self.run_in_thread(worker)
 
     def filter_grid(self, event=None):
-        df_source = None
-        if self.current_step == 1:
-            df_source = self.processor.aggregated_plan_df
-        elif self.current_step >= 2:
-            df_source = self.processor.simulated_plan_df
-
+        df_source = self.processor.aggregated_plan_df if self.current_step == 1 else self.processor.simulated_plan_df
         if df_source is None:
             df_to_show = pd.DataFrame()
         else:
+            sum_cols = []
             if self.current_step == 1 and self.processor.date_cols:
                 sum_cols = self.processor.date_cols
             elif self.current_step >= 2:
                 sum_cols = [c for c in df_source.columns if isinstance(c, str) and c.startswith('출고_')]
-            else: sum_cols = []
-            
-            if sum_cols: df_to_show = df_source[df_source[sum_cols].sum(axis=1) > 0].copy()
-            else: df_to_show = df_source.copy()
+            df_to_show = df_source[df_source[sum_cols].sum(axis=1) > 0].copy() if sum_cols else df_source.copy()
 
         search_term = self.search_entry.get().lower()
         if search_term:
@@ -1586,8 +1575,7 @@ class ProductionPlannerApp(ctk.CTk):
         display_cols = []
         for date_col in all_plan_cols:
             is_shipping_day = self.config_manager.config.get('DELIVERY_DAYS', {}).get(str(date_col.weekday()), 'False') == 'True'
-            is_non_shipping_date = date_col.date() in self.config_manager.config['NON_SHIPPING_DATES']
-            if is_shipping_day and not is_non_shipping_date:
+            if is_shipping_day and date_col.date() not in self.config_manager.config.get('NON_SHIPPING_DATES', []):
                 display_cols.append(date_col)
 
         if self.current_step < 2:
@@ -1595,7 +1583,6 @@ class ProductionPlannerApp(ctk.CTk):
             headers = ['Model'] + [d.strftime('%m-%d') for d in display_cols]
             for c, h_text in enumerate(headers):
                 ctk.CTkLabel(self.master_frame, text=h_text, font=self.font_header).grid(row=0, column=c, sticky="ew", padx=1, pady=2)
-            
             for r, row_data in df_display.iterrows():
                 model = row_data['Model']
                 bg = "#D6EAF8" if model in self.processor.highlight_models else "transparent"
@@ -1609,12 +1596,9 @@ class ProductionPlannerApp(ctk.CTk):
                     lbl_data.bind("<Double-Button-1>", lambda e, m=model: self.on_row_double_click(m))
         else:
             df_display = df_to_show.reset_index()
-            
-            # --- START MODIFIED LOGIC: 출고가 있는 차수만 표시 ---
             active_trucks_per_day = {}
             for d in display_cols:
                 date_str_md = d.strftime("%m%d")
-                # 열 이름을 문자열로 변환하여 endswith 함수 오류 방지
                 truck_cols_for_day = [str(c) for c in df_to_show.columns if str(c).startswith('출고_') and str(c).endswith(f"_{date_str_md}")]
                 active_trucks = []
                 if truck_cols_for_day:
@@ -1625,34 +1609,27 @@ class ProductionPlannerApp(ctk.CTk):
                             active_trucks.append(num)
                 if active_trucks:
                     active_trucks_per_day[d.date()] = active_trucks
-            # --- END MODIFIED LOGIC ---
-
+            
             ctk.CTkLabel(self.master_frame, text="Model", font=self.font_header).grid(row=0, column=0, rowspan=2, sticky="nsew", padx=1, pady=2)
-            
-            current_col_idx = 1
-            col_idx_map = {}
-            
+            current_col_idx, col_idx_map = 1, {}
             for d in display_cols:
                 date_obj = d.date()
                 if date_obj in active_trucks_per_day:
                     trucks_to_display = active_trucks_per_day[date_obj]
                     num_trucks = len(trucks_to_display)
                     if num_trucks > 0:
-                        date_header_text = f"{d.strftime('%m-%d')}"
-                        ctk.CTkLabel(self.master_frame, text=date_header_text, font=self.font_header, justify="center").grid(row=0, column=current_col_idx, columnspan=num_trucks, sticky="ew", padx=1, pady=2)
+                        ctk.CTkLabel(self.master_frame, text=f"{d.strftime('%m-%d')}", font=self.font_header, justify="center").grid(row=0, column=current_col_idx, columnspan=num_trucks, sticky="ew", padx=1, pady=2)
                         col_idx_map[date_obj] = (current_col_idx, trucks_to_display)
                         for truck_num in trucks_to_display:
                             ctk.CTkLabel(self.master_frame, text=f"{truck_num}차", font=self.font_header).grid(row=1, column=current_col_idx, sticky="ew", padx=1, pady=2)
                             current_col_idx += 1
-
+            
             for r, row_data in df_display.iterrows():
-                row_idx = r + 2
-                model = row_data['Model']
+                row_idx, model = r + 2, row_data['Model']
                 bg_color = "#D6EAF8" if model in self.processor.highlight_models else "#FFFFFF"
                 lbl_model = ctk.CTkLabel(self.master_frame, text=model, fg_color=bg_color, font=self.font_normal, anchor="w", padx=5)
                 lbl_model.grid(row=row_idx, column=0, sticky="ew")
                 lbl_model.bind("<Double-Button-1>", lambda e, m=model: self.on_row_double_click(m))
-                
                 for date_col in display_cols:
                     date_obj = date_col.date()
                     if date_obj in col_idx_map:
@@ -1661,39 +1638,31 @@ class ProductionPlannerApp(ctk.CTk):
                             col_name = f'출고_{truck_num}차_{date_col.strftime("%m%d")}'
                             val = row_data.get(col_name, 0)
                             is_fixed = any(s['model'] == model and s['date'] == date_col.date() and s['truck_num'] == truck_num for s in self.processor.fixed_shipments)
-                            text = f"{val:,.0f}" if val else "0"
-                            label_bg, text_color = bg_color, "black"
+                            text, label_bg, text_color = f"{val:,.0f}" if val else "0", bg_color, "black"
                             if is_fixed: label_bg, text_color = "#A9CCE3", "blue"
-                            
                             data_label = ctk.CTkLabel(self.master_frame, text=text, fg_color=label_bg, font=self.font_bold if is_fixed else self.font_normal, anchor="e", padx=5, text_color=text_color)
                             data_label.grid(row=row_idx, column=start_col + i, sticky="ew")
                             data_label.bind("<Double-Button-1>", lambda e, m=model, d=date_col.date(), t=truck_num: self.on_shipment_double_click(e, m, d, t))
                             data_label.bind("<Button-3>", lambda e, m=model, d=date_col.date(), t=truck_num: self.on_shipment_right_click(e, m, d, t))
 
             summary_row_idx = len(df_display) + 2
-            summary_bg_color = "#EAECEE"
-            
-            summary_label = ctk.CTkLabel(self.master_frame, text="합계", fg_color=summary_bg_color, font=self.font_bold, anchor="center")
-            summary_label.grid(row=summary_row_idx, column=0, sticky="ew", padx=1, pady=2)
-            
+            ctk.CTkLabel(self.master_frame, text="합계", fg_color="#EAECEE", font=self.font_bold, anchor="center").grid(row=summary_row_idx, column=0, sticky="ew", padx=1, pady=2)
+            pallet_size = self.config_manager.config.get('PALLET_SIZE', 60)
             for date_col in display_cols:
                 date_obj = date_col.date()
                 if date_obj in col_idx_map:
                     start_col, trucks_to_display = col_idx_map[date_obj]
                     for i, truck_num in enumerate(trucks_to_display):
                         col_name = f'출고_{truck_num}차_{date_col.strftime("%m%d")}'
-                        total_sum = 0
+                        total_sum, total_pallets = 0, 0
                         if col_name in df_to_show.columns:
                             total_sum = df_to_show[col_name].sum()
-                        
-                        sum_label = ctk.CTkLabel(self.master_frame, text=f"{total_sum:,.0f}", fg_color=summary_bg_color, font=self.font_bold, anchor="e", padx=5)
-                        sum_label.grid(row=summary_row_idx, column=start_col + i, sticky="ew", padx=1, pady=2)
+                            total_pallets = df_to_show[col_name].apply(lambda qty: math.ceil(qty / pallet_size) if qty > 0 else 0).sum()
+                        summary_text = f"{total_sum:,.0f}\n({int(total_pallets)} P)"
+                        ctk.CTkLabel(self.master_frame, text=summary_text, fg_color="#EAECEE", font=self.font_bold, anchor="e", padx=5).grid(row=summary_row_idx, column=start_col + i, sticky="ew", padx=1, pady=2)
 
     def on_row_double_click(self, model_name):
-        if self.current_step < 2:
-            self.update_status_bar("상세 뷰를 보려면 2단계 시뮬레이션을 먼저 실행해야 합니다.")
-            self.bell()
-            return
+        if self.current_step < 2: return
         self.last_selected_model = model_name
         self.populate_detail_view(model_name)
         self.tabview.set("상세")
@@ -1701,79 +1670,57 @@ class ProductionPlannerApp(ctk.CTk):
     
     def on_shipment_double_click(self, event, model, date, truck_num):
         if self.current_step < 2: return
-        
-        is_shipping_day = self.config_manager.config.get('DELIVERY_DAYS', {}).get(str(date.weekday()), 'False') == 'True'
-        is_non_shipping_date = date in self.config_manager.config['NON_SHIPPING_DATES']
-        if not is_shipping_day or is_non_shipping_date:
-            messagebox.showinfo("출고 불가", "납품 불가능한 요일이거나 휴무일입니다.")
-            return
-        
-        pallet_size = self.config_manager.config.get('PALLET_SIZE', 60)
-        
-        col_name = f'출고_{truck_num}차_{date.strftime("%m%d")}'
-        current_value = self.processor.simulated_plan_df.loc[model, col_name]
-        
-        dialog = ctk.CTkInputDialog(
-            text=f"'{model}' {date.strftime('%m-%d')} {truck_num}차 출고량을 수동으로 수정/고정합니다.\n\n(현재값: {current_value:,.0f})", 
-            title="출고량 수동 고정"
-        )
+        dialog = ctk.CTkInputDialog(text=f"'{model}' {date.strftime('%m-%d')} {truck_num}차 출고량을 수동으로 수정/고정합니다.\n\n(현재값: {self.processor.simulated_plan_df.loc[model, f'출고_{truck_num}차_{date.strftime("%m%d")}']:,.0f})", title="출고량 수동 고정")
         new_value_str = dialog.get_input()
-        
         if new_value_str is not None:
             try:
                 new_value = int(new_value_str)
                 if new_value < 0: raise ValueError
-                
                 self.fix_shipment(model, date, new_value, truck_num)
                 self.recalculate_with_fixed_values()
-                self.update_status_bar(f"'{model}' {date.strftime('%m-%d')} {truck_num}차 출고량이 {new_value:,.0f}개로 고정되었습니다.")
-                logging.info(f"출고량 수동 고정: 모델='{model}', 날짜={date}, 차수={truck_num}, 수량={new_value}")
             except (ValueError, TypeError):
                 messagebox.showerror("입력 오류", "유효한 숫자를 입력해주세요.", parent=self)
 
     def on_shipment_right_click(self, event, model, date, truck_num):
         if self.current_step < 2: return
-        
-        is_shipping_day = self.config_manager.config.get('DELIVERY_DAYS', {}).get(str(date.weekday()), 'False') == 'True'
-        is_non_shipping_date = date in self.config_manager.config['NON_SHIPPING_DATES']
-        if not is_shipping_day or is_non_shipping_date: return
-        
         menu = Menu(self, tearoff=0)
         is_fixed = any(s['model'] == model and s['date'] == date and s['truck_num'] == truck_num for s in self.processor.fixed_shipments)
-        
         if is_fixed:
             menu.add_command(label=f"{truck_num}차 고정 해제", command=lambda: self.unfix_shipment(model, date, truck_num))
         else:
             menu.add_command(label=f"{truck_num}차 고정", command=lambda: self.on_fix_request(model, date, truck_num))
-        
         menu.tk_popup(event.x_root, event.y_root)
 
     def on_fix_request(self, model, date, truck_num):
         if self.processor.simulated_plan_df is None: return
-        
-        col_name = f'출고_{truck_num}차_{date.strftime("%m%d")}'
-        shipment_value = self.processor.simulated_plan_df.loc[model, col_name]
-        
+        shipment_value = self.processor.simulated_plan_df.loc[model, f'출고_{truck_num}차_{date.strftime("%m%d")}']
         self.fix_shipment(model, date, shipment_value, truck_num)
         self.recalculate_with_fixed_values()
-        self.update_status_bar(f"'{model}'의 {date.strftime('%m-%d')} {truck_num}차 출고량이 {shipment_value:,.0f}개로 고정되었습니다.")
-        logging.info(f"출고량 고정: 모델='{model}', 날짜={date}, 차수={truck_num}, 수량={shipment_value}")
 
     def fix_shipment(self, model, date, qty, truck_num):
         self.processor.fixed_shipments = [s for s in self.processor.fixed_shipments if not (s['model'] == model and s['date'] == date and s['truck_num'] == truck_num)]
         self.processor.fixed_shipments.append({'model': model, 'date': date, 'qty': qty, 'truck_num': truck_num})
-        logging.info(f"출고량 고정 업데이트: 모델='{model}', 날짜={date}, 수량={qty}, 차수={truck_num}")
+        logging.info(f"출고량 고정: {model}, {date}, {qty}, {truck_num}차")
 
     def unfix_shipment(self, model, date, truck_num):
         self.processor.fixed_shipments = [s for s in self.processor.fixed_shipments if not (s['model'] == model and s['date'] == date and s['truck_num'] == truck_num)]
         self.recalculate_with_fixed_values()
-        self.update_status_bar(f"'{model}'의 {date.strftime('%m-%d')} {truck_num}차 출고량이 고정 해제되었습니다.")
-        logging.info(f"출고량 고정 해제: 모델='{model}', 날짜={date}, 차수={truck_num}")
+        logging.info(f"출고량 고정 해제: {model}, {date}, {truck_num}차")
+        
+    def update_unmet_demand_warnings(self):
+        for widget in self.unmet_list_frame.winfo_children():
+            widget.destroy()
+        if self.processor.unmet_demand_log:
+            self.unmet_demand_frame.grid()
+            for log in self.processor.unmet_demand_log:
+                msg = f"{log['date'].strftime('%m/%d')} {log['model']}: 필수 출고량 {log['unmet_qty']:,}개 부족"
+                ctk.CTkLabel(self.unmet_list_frame, text=msg, font=self.font_small, anchor="w").pack(fill="x", padx=5)
+        else:
+            self.unmet_demand_frame.grid_remove()
 
     def update_shortage_warnings(self, propose_fix=True):
         for widget in self.shortage_list_frame.winfo_children():
             widget.destroy()
-
         df = self.processor.simulated_plan_df
         if df is None:
             self.shortage_frame.grid_remove()
@@ -1784,40 +1731,26 @@ class ProductionPlannerApp(ctk.CTk):
             self.shortage_frame.grid_remove()
             return
         
-        shortages_info = []
-        shortage_messages = []
-
-        # Use priority-sorted index to check for shortages
+        shortages_info, shortage_messages = [], []
         sorted_models = self.processor.item_master_df.index
         for model in sorted_models:
             if model not in df.index: continue
-            
             safety_stock = self.processor.item_master_df.loc[model, 'SafetyStock']
             for inv_col in inventory_cols:
                 if df.loc[model, inv_col] < safety_stock:
                     date_str = inv_col.split('_')[1]
                     year = self.processor.date_cols[0].year
-                    try:
-                        date_obj = datetime.datetime.strptime(f"{year}-{date_str}", "%Y-%m%d").date()
-                    except ValueError:
-                        date_obj = datetime.datetime.strptime(f"{year+1}-{date_str}", "%Y-%m%d").date()
-
-                    info = {
-                        "model": model,
-                        "shortage_date": date_obj,
-                        "current_stock": df.loc[model, inv_col],
-                        "safety_stock": safety_stock
-                    }
+                    try: date_obj = datetime.datetime.strptime(f"{year}-{date_str}", "%Y-%m%d").date()
+                    except ValueError: date_obj = datetime.datetime.strptime(f"{year+1}-{date_str}", "%Y-%m%d").date()
+                    info = {"model": model, "shortage_date": date_obj, "current_stock": df.loc[model, inv_col], "safety_stock": safety_stock}
                     shortages_info.append(info)
                     shortage_messages.append(f"{model}: {date_obj.strftime('%m/%d')} 재고({info['current_stock']:,}) < 최소({info['safety_stock']:,})")
-                    break # Only report the first shortage for each model
+                    break
         
         if shortages_info:
             self.shortage_frame.grid()
             for msg in shortage_messages:
-                label = ctk.CTkLabel(self.shortage_list_frame, text=msg, font=self.font_small, anchor="w")
-                label.pack(fill="x", padx=5)
-            
+                ctk.CTkLabel(self.shortage_list_frame, text=msg, font=self.font_small, anchor="w").pack(fill="x", padx=5)
             if propose_fix and not self.is_task_running:
                 self.propose_shortage_fix(shortages_info)
         else:
@@ -1825,16 +1758,13 @@ class ProductionPlannerApp(ctk.CTk):
 
     def propose_shortage_fix(self, shortages_info):
         first_shortage = sorted(shortages_info, key=lambda x: x['shortage_date'])[0]
-        
-        model = first_shortage['model']
-        shortage_date = first_shortage['shortage_date']
+        model, shortage_date = first_shortage['model'], first_shortage['shortage_date']
         
         proposed_shipping_date = None
         check_date = shortage_date - datetime.timedelta(days=1)
         while self.processor.date_cols and check_date >= self.processor.date_cols[0].date():
             is_shipping_day = self.config_manager.config.get('DELIVERY_DAYS', {}).get(str(check_date.weekday()), 'False') == 'True'
-            is_non_shipping_date = check_date in self.config_manager.config['NON_SHIPPING_DATES']
-            if is_shipping_day and not is_non_shipping_date:
+            if is_shipping_day and check_date not in self.config_manager.config['NON_SHIPPING_DATES']:
                 proposed_shipping_date = check_date
                 break
             check_date -= datetime.timedelta(days=1)
@@ -1844,34 +1774,24 @@ class ProductionPlannerApp(ctk.CTk):
             return
 
         current_max_trucks = self.config_manager.config.get('DAILY_TRUCK_OVERRIDES', {}).get(proposed_shipping_date, self.config_manager.config.get('MAX_TRUCKS_PER_DAY', 2))
-        new_max_trucks = current_max_trucks + 1
-
         msg = (f"'{model}' 품목의 재고가 {shortage_date.strftime('%m-%d')}에 부족할 것으로 예상됩니다.\n\n"
                f"이 문제를 해결하기 위해, {proposed_shipping_date.strftime('%m-%d')}의 최대 출고 차수를\n"
-               f"{current_max_trucks}회에서 {new_max_trucks}회로 늘리시겠습니까?")
-
+               f"{current_max_trucks}회에서 {current_max_trucks + 1}회로 늘리시겠습니까?")
         if messagebox.askyesno("재고 부족 해결 방안 제안", msg, parent=self):
-            self.config_manager.config['DAILY_TRUCK_OVERRIDES'][proposed_shipping_date] = new_max_trucks
-            logging.info(f"사용자 동의: {proposed_shipping_date}의 최대 차수를 {new_max_trucks}로 설정.")
+            self.config_manager.config['DAILY_TRUCK_OVERRIDES'][proposed_shipping_date] = current_max_trucks + 1
             self.save_settings_and_recalculate()
 
     def populate_detail_view(self, model_name):
         for widget in self.detail_frame.winfo_children():
             widget.destroy()
-
         if self.processor.simulated_plan_df is None: return
         model_data = self.processor.simulated_plan_df.loc[model_name]
 
-        chart_frame = ctk.CTkFrame(self.detail_frame)
-        chart_frame.pack(fill='x', expand=True, padx=10, pady=10)
-        
         fig, ax = plt.subplots(figsize=(12, 4))
         dates = self.processor.date_cols
         date_strs = [d.strftime('%m-%d') for d in dates]
-        
         inventory = [model_data.get(f"재고_{d.strftime('%m%d')}", 0) for d in dates]
         production = [model_data.get(d, 0) for d in dates]
-        
         shipment_cols = [c for c in model_data.index if isinstance(c, str) and c.startswith('출고_')]
         shipments_by_date = {d: 0 for d in dates}
         for col in shipment_cols:
@@ -1880,57 +1800,41 @@ class ProductionPlannerApp(ctk.CTk):
                 date_obj = datetime.datetime.strptime(f"{dates[0].year}-{date_str_from_col[:2]}-{date_str_from_col[2:]}", "%Y-%m-%d")
                 if date_obj in shipments_by_date:
                     shipments_by_date[date_obj] += model_data[col]
-            except (ValueError, KeyError):
-                continue
-        
+            except (ValueError, KeyError): continue
         total_shipments = [shipments_by_date[d] for d in dates]
 
         ax.plot(date_strs, inventory, marker='o', linestyle='-', label='예상 재고')
         ax.bar(date_strs, production, color='skyblue', label='생산량')
         ax.bar(date_strs, [-s for s in total_shipments], color='salmon', label='총출고량')
-
         safety_stock = self.processor.item_master_df.loc[model_name, 'SafetyStock']
         if safety_stock > 0:
             ax.axhline(y=safety_stock, color='r', linestyle='--', label=f'최소 재고 ({safety_stock:,})')
-
         ax.set_title(f"'{model_name}' 재고 및 입출고 추이", fontdict={'fontsize': 14})
-        ax.set_xlabel("날짜")
-        ax.set_ylabel("수량")
-        ax.legend()
-        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
-        fig.tight_layout()
+        ax.set_xlabel("날짜"); ax.set_ylabel("수량")
+        ax.legend(); ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right"); fig.tight_layout()
 
-        canvas = FigureCanvasTkAgg(fig, master=chart_frame)
+        canvas = FigureCanvasTkAgg(fig, master=self.detail_frame)
         canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
+        canvas.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
     
     def check_shipment_capacity(self):
-        df = self.processor.simulated_plan_df
+        df, messages = self.processor.simulated_plan_df, []
         if df is None or not self.processor.date_cols: return
-        
         truck_capacity = self.config_manager.config.get('PALLETS_PER_TRUCK', 36) * self.config_manager.config.get('PALLET_SIZE', 60)
-        messages = []
-        
         all_shipment_cols = [col for col in df.columns if isinstance(col, str) and col.startswith('출고_')]
-        
         grouped_cols = {}
         for col in all_shipment_cols:
-            parts = col.split('_')
-            truck_num, date_str = parts[1], parts[2]
-            key = (date_str, truck_num)
+            parts = col.split('_'); key = (parts[2], parts[1])
             if key not in grouped_cols: grouped_cols[key] = []
             grouped_cols[key].append(col)
-
         for (date_str, truck_num), cols in grouped_cols.items():
             total_shipped = df[cols].sum().sum()
             if total_shipped > truck_capacity:
                 date_obj = datetime.datetime.strptime(f"{datetime.date.today().year}{date_str}", "%Y%m%d")
                 messages.append(f"{date_obj.strftime('%m-%d')} {truck_num}: 출고량 {total_shipped:,.0f} > 용량 {truck_capacity:,.0f}.")
-        
         if messages:
             messagebox.showwarning("출고 용량 초과", "\n".join(messages))
-            logging.warning("출고 용량 초과 경고 발생.")
     
     def update_status_bar(self, message="준비 완료"):
         self.status_bar.configure(text=f"현재 파일: {self.current_file} | 상태: {message}")
@@ -1940,12 +1844,8 @@ class ProductionPlannerApp(ctk.CTk):
         for key, entry_widget in self.settings_entries.items():
             entry_widget.delete(0, 'end')
             entry_widget.insert(0, str(self.config_manager.config.get(key, '')))
-            
         for i, cb in self.day_checkboxes.items():
-            if self.config_manager.config.get('DELIVERY_DAYS', {}).get(str(i), 'False') == 'True':
-                cb.select()
-            else:
-                cb.deselect()
+            cb.select() if self.config_manager.config.get('DELIVERY_DAYS', {}).get(str(i), 'False') == 'True' else cb.deselect()
         logging.info("UI에 설정값 로드 완료.")
     
     def open_daily_truck_dialog(self):
@@ -1964,14 +1864,13 @@ class ProductionPlannerApp(ctk.CTk):
             self.save_settings_and_recalculate()
 
     def open_safety_stock_dialog(self):
-        if self.processor.item_master_df is None:
-            messagebox.showerror("오류", "품목 정보(Item.csv)가 로드되지 않았습니다."); return
+        if self.processor.item_master_df is None: return
         dialog = SafetyStockDialog(self, self.processor.item_master_df)
         self.wait_window(dialog)
         if dialog.result is not None:
             self.processor.item_master_df = dialog.result
             self.processor.save_item_master()
-            messagebox.showinfo("저장 완료", "품목별 최소 재고 설정이 저장되었습니다. '설정 저장 및 재계산' 버튼을 눌러 계획에 반영하세요.")
+            messagebox.showinfo("저장 완료", "최소 재고 설정이 저장되었습니다. '설정 저장 및 재계산'으로 계획에 반영하세요.")
             if self.current_step >=2:
                 self.recalculate_with_fixed_values()
 
