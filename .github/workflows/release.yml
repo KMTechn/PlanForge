@@ -1,0 +1,53 @@
+# 워크플로우 이름
+name: Build and Release Inspection Program
+
+# 'v'로 시작하는 태그가 푸시될 때 실행
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 작업에 저장소 쓰기 권한 부여
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    # Windows 환경에서 실행
+    runs-on: windows-latest
+
+    steps:
+      # 1. 소스 코드 내려받기
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. 파이썬 설치 (사용자 환경과 동일한 3.12 버전으로 설정)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 3. requirements.txt와 PyInstaller 설치
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # 4. PyInstaller로 .exe 파일 빌드
+      #    - 이름, 아이콘, 포함할 폴더(assets, config) 등을 프로젝트에 맞게 수정
+      - name: Build with PyInstaller
+        run: pyinstaller --name "Inspection_worker" --onedir --windowed --icon="assets/logo.ico" --add-data "assets;assets" --add-data "config;config" --hidden-import pygame --hidden-import Pillow --hidden-import keyboard Inspection_worker.py
+
+      # 5. 빌드 결과물(dist/Inspection_worker 폴더)을 zip 파일로 압축
+      - name: Zip the build folder
+        run: Compress-Archive -Path dist/Inspection_worker -DestinationPath "Inspection_worker-${{ github.ref_name }}.zip"
+      
+      # 6. 릴리즈 생성 및 압축 파일(Asset) 업로드
+      #    - 릴리즈 노트를 자동으로 생성하도록 설정
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "Inspection_worker-${{ github.ref_name }}.zip"
+          name: "Release ${{ github.ref_name }}"
+          generate_release_notes: true

@@ -46,8 +46,8 @@ from queue import Queue, Empty
 # ===================================================================
 # GitHub 자동 업데이트 설정
 # ===================================================================
-REPO_OWNER = "Your-GitHub-Username"
-REPO_NAME = "PlanForge-Repository-Name"
+REPO_OWNER = "KMTechn"
+REPO_NAME = "PlanForge"
 CURRENT_VERSION = "v1.0.0" # 버전 업데이트
 # ===================================================================
 
