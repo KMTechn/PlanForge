@@ -1,42 +1,36 @@
 # 워크플로우 이름
 name: Build and Release PlanForge
 
-# 'v'로 시작하는 태그가 푸시될 때 실행
 on:
   push:
     tags:
       - 'v*'
 
-# 작업에 저장소 쓰기 권한 부여
 permissions:
   contents: write
 
 jobs:
   build-and-release:
-    # Windows 환경에서 실행
     runs-on: windows-latest
 
     steps:
-      # 1. 소스 코드 내려받기
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. 파이썬 설치 (사용자 환경과 동일한 3.12 버전으로 설정)
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # 3. requirements.txt와 PyInstaller 설치
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # 4. PyInstaller로 .exe 파일 빌드
+      # 4. PyInstaller로 .exe 파일 빌드 (config 폴더 추가 부분 제거)
       - name: Build with PyInstaller
-        run: pyinstaller --name "PlanForge" --onedir --windowed --icon="assets/logo.ico" --add-data "assets;assets" --add-data "config;config" --hidden-import pygame --hidden-import Pillow --hidden-import keyboard PlanForge.py
+        run: pyinstaller --name "PlanForge" --onedir --windowed --icon="assets/logo.ico" --add-data "assets;assets" --hidden-import pygame --hidden-import Pillow --hidden-import keyboard PlanForge.py
 
       # 5. 빌드 결과물(dist/PlanForge 폴더)을 zip 파일로 압축
       - name: Zip the build folder

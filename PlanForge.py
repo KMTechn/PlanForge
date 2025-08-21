@@ -152,79 +152,19 @@ plt.rcParams['axes.unicode_minus'] = False
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ConfigManager:
-    def __init__(self, config_path='config.xlsx'):
-        self.config_path = config_path
+    def __init__(self):
+        # config.xlsx 파일을 읽는 대신, 모든 설정값을 코드 내에 직접 정의합니다.
         self.config = {
             'PALLET_SIZE': 60,
             'LEAD_TIME_DAYS': 2,
             'PALLETS_PER_TRUCK': 36,
             'MAX_TRUCKS_PER_DAY': 2,
             'FONT_SIZE': 11,
-            'DELIVERY_DAYS': {str(i): 'True' if i < 5 else 'False' for i in range(7)},
+            'DELIVERY_DAYS': {str(i): 'True' if i < 5 else 'False' for i in range(7)}, # 월~금 납품
             'NON_SHIPPING_DATES': [],
             'DAILY_TRUCK_OVERRIDES': {}
         }
-        if os.path.exists(self.config_path):
-            self.load_config()
-
-    def load_config(self):
-        try:
-            settings_df = pd.read_excel(self.config_path, sheet_name='Settings').set_index('Setting')['Value']
-            self.config['PALLET_SIZE'] = int(settings_df.get('PALLET_SIZE', 60))
-            self.config['LEAD_TIME_DAYS'] = int(settings_df.get('LEAD_TIME_DAYS', 2))
-            self.config['PALLETS_PER_TRUCK'] = int(settings_df.get('PALLETS_PER_TRUCK', 36))
-            self.config['MAX_TRUCKS_PER_DAY'] = int(settings_df.get('MAX_TRUCKS_PER_DAY', 2))
-            self.config['FONT_SIZE'] = int(settings_df.get('FONT_SIZE', 11))
-            
-            try:
-                delivery_df = pd.read_excel(self.config_path, sheet_name='DeliveryConfig')
-                self.config['DELIVERY_DAYS'] = delivery_df[~delivery_df['Key'].str.contains('NonShipping')].set_index('Key')['Value'].to_dict()
-                non_shipping_dates = delivery_df[delivery_df['Key'] == 'NonShippingDates']['Value'].tolist()
-                self.config['NON_SHIPPING_DATES'] = [datetime.datetime.strptime(str(d).split()[0], '%Y-%m-%d').date() for d in non_shipping_dates if d and isinstance(d, (str, datetime.datetime))]
-            except Exception:
-                logging.warning("DeliveryConfig 시트를 찾을 수 없거나 로드 오류가 발생했습니다. 기본값을 사용합니다.")
-
-            try:
-                truck_overrides_df = pd.read_excel(self.config_path, sheet_name='DailyTruckConfig')
-                truck_overrides_df['Date'] = pd.to_datetime(truck_overrides_df['Date']).dt.date
-                self.config['DAILY_TRUCK_OVERRIDES'] = truck_overrides_df.set_index('Date')['MaxTrucks'].to_dict()
-                logging.info(f"{len(self.config['DAILY_TRUCK_OVERRIDES'])}개의 일자별 최대 차수 설정을 로드했습니다.")
-            except Exception:
-                logging.warning("DailyTruckConfig 시트를 찾을 수 없거나 로드 오류가 발생했습니다. 기본값을 사용합니다.")
-                self.config['DAILY_TRUCK_OVERRIDES'] = {}
-
-            logging.info("Config.xlsx 파일에서 설정을 성공적으로 로드했습니다.")
-        except Exception as e:
-            logging.error(f"Config load error: {e}")
-            raise ValueError(f"`{self.config_path}` 로드 중 오류 발생: {e}. 시트 이름을 확인하세요.")
-
-    def save_config(self, config_data):
-        try:
-            with pd.ExcelWriter(self.config_path, engine='openpyxl') as writer:
-                settings_df = pd.DataFrame([
-                    {'Setting': 'PALLET_SIZE', 'Value': config_data.get('PALLET_SIZE'), 'Description': '하나의 팔레트에 들어가는 제품 수량'},
-                    {'Setting': 'LEAD_TIME_DAYS', 'Value': config_data.get('LEAD_TIME_DAYS'), 'Description': '자재 발주 후 도착까지 걸리는 일수 (영업일 기준)'},
-                    {'Setting': 'PALLETS_PER_TRUCK', 'Value': config_data.get('PALLETS_PER_TRUCK'), 'Description': '트럭 한 대에 실을 수 있는 최대 팔레트 수'},
-                    {'Setting': 'MAX_TRUCKS_PER_DAY', 'Value': config_data.get('MAX_TRUCKS_PER_DAY'), 'Description': '하루에 운행 가능한 최대 트럭 수'},
-                    {'Setting': 'FONT_SIZE', 'Value': config_data.get('FONT_SIZE'), 'Description': 'UI 기본 폰트 크기'}
-                ])
-                settings_df.to_excel(writer, sheet_name='Settings', index=False)
-                
-                delivery_data = [{'Key': key, 'Value': value} for key, value in config_data['DELIVERY_DAYS'].items()]
-                delivery_data.extend([{'Key': 'NonShippingDates', 'Value': date.strftime('%Y-%m-%d')} for date in config_data['NON_SHIPPING_DATES']])
-                delivery_df = pd.DataFrame(delivery_data)
-                delivery_df.to_excel(writer, sheet_name='DeliveryConfig', index=False)
-                
-                if config_data.get('DAILY_TRUCK_OVERRIDES'):
-                    overrides_data = [{'Date': date.strftime('%Y-%m-%d'), 'MaxTrucks': trucks} for date, trucks in config_data['DAILY_TRUCK_OVERRIDES'].items()]
-                    overrides_df = pd.DataFrame(overrides_data)
-                    overrides_df.to_excel(writer, sheet_name='DailyTruckConfig', index=False)
-
-            self.config = config_data
-            logging.info("설정을 config.xlsx 파일에 성공적으로 저장했습니다.")
-        except Exception as e:
-            logging.error(f"Config save error: {e}")
-            raise IOError(f"설정 파일 저장 실패: {e}")
+        logging.info("기본 설정값을 로드했습니다.")
 
 class PlanProcessor:
     def __init__(self, config):
@@ -249,7 +189,7 @@ class PlanProcessor:
             self.item_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'assets', 'Item.csv')
             if not os.path.exists(self.item_path):
                 raise FileNotFoundError("assets/Item.csv 파일을 찾을 수 없습니다.")
-                
+            
             self.item_master_df = pd.read_csv(self.item_path)
 
             if 'Priority' not in self.item_master_df.columns:
@@ -1490,7 +1430,7 @@ class ProductionPlannerApp(ctk.CTk):
 
         def worker():
             try:
-                self.config_manager.save_config(new_config)
+                # self.config_manager.save_config(new_config) # 파일 저장은 더이상 하지 않음
                 self.processor.config = new_config
                 if self.current_step >= 1: self.processor.process_plan_file()
                 if self.current_step >= 2:
