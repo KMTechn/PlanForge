@@ -1,5 +1,5 @@
 # 워크플로우 이름
-name: Build and Release Inspection Program
+name: Build and Release PlanForge
 
 # 'v'로 시작하는 태그가 푸시될 때 실행
 on:
@@ -35,19 +35,17 @@ jobs:
           pip install pyinstaller
 
       # 4. PyInstaller로 .exe 파일 빌드
-      #    - 이름, 아이콘, 포함할 폴더(assets, config) 등을 프로젝트에 맞게 수정
       - name: Build with PyInstaller
-        run: pyinstaller --name "Inspection_worker" --onedir --windowed --icon="assets/logo.ico" --add-data "assets;assets" --add-data "config;config" --hidden-import pygame --hidden-import Pillow --hidden-import keyboard Inspection_worker.py
+        run: pyinstaller --name "PlanForge" --onedir --windowed --icon="assets/logo.ico" --add-data "assets;assets" --add-data "config;config" --hidden-import pygame --hidden-import Pillow --hidden-import keyboard PlanForge.py
 
-      # 5. 빌드 결과물(dist/Inspection_worker 폴더)을 zip 파일로 압축
+      # 5. 빌드 결과물(dist/PlanForge 폴더)을 zip 파일로 압축
       - name: Zip the build folder
-        run: Compress-Archive -Path dist/Inspection_worker -DestinationPath "Inspection_worker-${{ github.ref_name }}.zip"
+        run: Compress-Archive -Path dist/PlanForge -DestinationPath "PlanForge-${{ github.ref_name }}.zip"
       
       # 6. 릴리즈 생성 및 압축 파일(Asset) 업로드
-      #    - 릴리즈 노트를 자동으로 생성하도록 설정
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: "Inspection_worker-${{ github.ref_name }}.zip"
+          files: "PlanForge-${{ github.ref_name }}.zip"
           name: "Release ${{ github.ref_name }}"
           generate_release_notes: true
