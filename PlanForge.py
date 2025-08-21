@@ -19,6 +19,19 @@ import subprocess
 import threading
 from queue import Queue, Empty
 
+# ===================================================================
+# PyInstaller 빌드 환경을 위한 리소스 경로 설정 함수 (★ 수정된 부분)
+# ===================================================================
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller는 임시 폴더를 생성하고 _MEIPASS에 경로를 저장합니다.
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 # --- Business Logic & Workflow ---
 # 1. 목표 (Goal):
 #    - 고객사의 생산 계획과 현재고를 바탕으로, 재고 부족(Stock-out) 및 과잉을 최소화하는 일일 최적 부품 납품 수량을 계산한다.
@@ -36,9 +49,9 @@ from queue import Queue, Empty
 #    - 우선순위 기반 적재 (Priority-Based Loading): 'Item.csv'에 정의된 우선순위에 따라 긴급한 품목부터 트럭에 적재한다.
 #
 #    - 이중 예측 기반 필요량 산출 (Dual-Horizon Requirement Calculation):
-#        - 단기 예측 (Short-Term): '리드타임'을 기반으로 당장 긴급하게 필요한 물량을 계산한다 (예: 2-3일).
-#        - 장기 예측 (Long-Term): 더 긴 미래(예: 7일)의 총생산량을 함께 예측하여, 갑작스러운 생산량 폭증에 대비한 선제적 납품 물량을 계산한다.
-#        - 최종 결정: 단기/장기 예측 중 더 많은 수량을 요구하는 쪽을 기준으로 당일 필요량을 결정하여, 미래의 결품 위기를 사전에 방지한다.
+#         - 단기 예측 (Short-Term): '리드타임'을 기반으로 당장 긴급하게 필요한 물량을 계산한다 (예: 2-3일).
+#         - 장기 예측 (Long-Term): 더 긴 미래(예: 7일)의 총생산량을 함께 예측하여, 갑작스러운 생산량 폭증에 대비한 선제적 납품 물량을 계산한다.
+#         - 최종 결정: 단기/장기 예측 중 더 많은 수량을 요구하는 쪽을 기준으로 당일 필요량을 결정하여, 미래의 결품 위기를 사전에 방지한다.
 #
 #    - 계획 건전성 검사 (Plan Health Check): 필수 출고량을 당일 운송 용량 내에서 해결할 수 없는 경우, 이를 '계획 실패'로 간주하고 사용자에게 명확히 경고한다.
 # -----------------------------------------
@@ -186,9 +199,10 @@ class PlanProcessor:
 
     def _load_item_master(self):
         try:
-            self.item_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'assets', 'Item.csv')
+            # ★★★ 수정된 부분 ★★★
+            self.item_path = resource_path('assets/Item.csv')
             if not os.path.exists(self.item_path):
-                raise FileNotFoundError("assets/Item.csv 파일을 찾을 수 없습니다.")
+                raise FileNotFoundError(f"assets/Item.csv 파일을 찾을 수 없습니다. (경로: {self.item_path})")
             
             self.item_master_df = pd.read_csv(self.item_path)
 
@@ -431,7 +445,7 @@ class PlanProcessor:
                                 auto_shipments_today.loc[model, truck_num] += qty_to_ship
                                 truck_capacity_remains[truck_num] -= qty_to_ship
                                 remaining_must_ship.loc[model] -= qty_to_ship
-                    
+                        
                     for model in priority_models:
                         if truck_capacity_remains[truck_num] < pallet_size: break
                         if remaining_pull_forward.loc[model] > 0:
