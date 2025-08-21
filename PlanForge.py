@@ -48,7 +48,7 @@ from queue import Queue, Empty
 # ===================================================================
 REPO_OWNER = "Your-GitHub-Username"
 REPO_NAME = "PlanForge-Repository-Name"
-CURRENT_VERSION = "v2.5.0" # 버전 업데이트
+CURRENT_VERSION = "v1.0.0" # 버전 업데이트
 # ===================================================================
 
 # 자동 업데이트 기능 함수
