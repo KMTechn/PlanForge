@@ -19,6 +19,7 @@ import subprocess
 import threading
 from queue import Queue, Empty
 import json
+from openpyxl.styles import PatternFill # ◀◀◀ [추가됨] 엑셀 서식을 위한 라이브러리
 
 # ===================================================================
 # PyInstaller 빌드 환경을 위한 리소스 경로 설정 함수 (★ 수정된 부분)
@@ -35,27 +36,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 # --- Business Logic & Workflow ---
-# 1. 목표 (Goal):
-#    - 고객사의 생산 계획과 현재고를 바탕으로, 재고 부족(Stock-out) 및 과잉을 최소화하는 일일 최적 부품 납품 수량을 계산한다.
-#
-# 2. 핵심 프로세스 (Core Process):
-#    - 입력 (Input): 고객사 주간 생산 계획(Excel), 고객사 창고 부품 재고(Text 또는 Excel/CSV 파일)
-#    - 출력 (Output): 일자별, 모델별, 트럭 차수별 납품 계획
-#
-# 3. 주요 제약 조건 (Key Constraints):
-#    - 납품 시점 (Delivery Timing): 고객이 특정일(D-day)에 생산할 부품은, '적어도' 그 전날(D-1)까지는 고객사 창고에 도착해야 한다.
-#    - 출고 단위 (Shipment Unit): 1 트럭 = 36 팔레트, 1 팔레트 = 60 개. 따라서 1 트럭의 최대 적재량은 2,160개이다.
-#    - 출고 빈도 (Shipment Frequency): 하루 최대 2회 출고를 기본으로 하나, 필요시 3차, 4차 출고도 고려할 수 있다 (설정 가능).
-#
-# 4. 출고 결정 로직 (Shipment Decision Logic):
-#    - 우선순위 기반 적재 (Priority-Based Loading): 'Item.csv'에 정의된 우선순위에 따라 긴급한 품목부터 트럭에 적재한다.
-#
-#    - 이중 예측 기반 필요량 산출 (Dual-Horizon Requirement Calculation):
-#         - 단기 예측 (Short-Term): '리드타임'을 기반으로 당장 긴급하게 필요한 물량을 계산한다 (예: 2-3일).
-#         - 장기 예측 (Long-Term): 더 긴 미래(예: 7일)의 총생산량을 함께 예측하여, 갑작스러운 생산량 폭증에 대비한 선제적 납품 물량을 계산한다.
-#         - 최종 결정: 단기/장기 예측 중 더 많은 수량을 요구하는 쪽을 기준으로 당일 필요량을 결정하여, 미래의 결품 위기를 사전에 방지한다.
-#
-#    - 계획 건전성 검사 (Plan Health Check): 필수 출고량을 당일 운송 용량 내에서 해결할 수 없는 경우, 이를 '계획 실패'로 간주하고 사용자에게 명확히 경고한다.
+# (비즈니스 로직 설명은 이전과 동일)
 # -----------------------------------------
 
 # ===================================================================
@@ -66,7 +47,7 @@ REPO_NAME = "PlanForge"
 CURRENT_VERSION = "v1.0.1" # 버전 업데이트
 # ===================================================================
 
-# 자동 업데이트 기능 함수
+# 자동 업데이트 기능 함수 (이전과 동일)
 def check_for_updates(repo_owner: str, repo_name: str, current_version: str):
     logging.info("Checking for updates...")
     try:
@@ -167,6 +148,7 @@ plt.rcParams['axes.unicode_minus'] = False
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ConfigManager:
+    # ... (이전과 동일)
     def __init__(self):
         self.config_filepath = resource_path('config.json')
         self.config = self.load_config()
@@ -220,6 +202,7 @@ class ConfigManager:
             messagebox.showwarning("저장 오류", f"설정 파일 저장 중 오류가 발생했습니다:\n{e}")
 
 class PlanProcessor:
+    # ... (이전과 동일)
     def __init__(self, config):
         self.config = config
         self.aggregated_plan_df = None
@@ -587,9 +570,8 @@ class PlanProcessor:
         }
         
         return True, fix_details
-        
-# --- 위젯 클래스 ---
 
+# --- 위젯 클래스 (이전과 동일) ---
 class SearchableComboBox(ctk.CTkFrame):
     def __init__(self, parent, values):
         super().__init__(parent, fg_color="transparent")
@@ -960,6 +942,7 @@ class SafetyStockDialog(ctk.CTkToplevel):
         self.destroy()
 
 class ProductionPlannerApp(ctk.CTk):
+    # ... (__init__ 등 다른 메서드는 이전과 동일)
     def __init__(self, config_manager):
         super().__init__()
         self.config_manager = config_manager
@@ -1061,7 +1044,7 @@ class ProductionPlannerApp(ctk.CTk):
             self.destroy()
 
     def set_font_size(self, size):
-        size = max(8, min(24, size)) 
+        size = max(8, min(40, size)) 
         self.base_font_size = size
         self.config_manager.config['FONT_SIZE'] = size
 
@@ -1074,26 +1057,26 @@ class ProductionPlannerApp(ctk.CTk):
         self.font_header.configure(size=size + 1)
         self.font_edit.configure(size=size)
 
-        self.sidebar_title.configure(font=self.font_big_bold)
-        self.step1_button.configure(font=self.font_normal)
-        self.step2_button.configure(font=self.font_normal)
-        self.step3_button.configure(font=self.font_normal)
-        self.step4_button.configure(font=self.font_normal)
-        self.stabilize_button.configure(font=self.font_normal)
-        self.font_size_title_label.configure(font=self.font_normal)
-        self.font_minus_button.configure(font=self.font_normal)
-        self.font_size_label.configure(text=str(size), font=self.font_normal)
-        self.font_plus_button.configure(font=self.font_normal)
-        self.settings_title_label.configure(font=self.font_bold)
-        
-        if hasattr(self, 'setting_labels'):
+        if hasattr(self, 'sidebar_title'):
+            self.sidebar_title.configure(font=self.font_big_bold)
+            self.step1_button.configure(font=self.font_normal)
+            self.step2_button.configure(font=self.font_normal)
+            self.step3_button.configure(font=self.font_normal)
+            self.step4_button.configure(font=self.font_normal)
+            self.stabilize_button.configure(font=self.font_normal)
+            self.font_size_title_label.configure(font=self.font_normal)
+            self.font_minus_button.configure(font=self.font_normal)
+            self.font_size_label.configure(text=str(size), font=self.font_normal)
+            self.font_plus_button.configure(font=self.font_normal)
+            self.settings_title_label.configure(font=self.font_bold)
+            
             for label in self.setting_labels:
                 label.configure(font=self.font_normal)
             for entry in self.settings_entries.values():
                 entry.configure(font=self.font_normal)
             for cb in self.day_checkboxes.values():
                 cb.configure(font=self.font_normal)
-            
+                
             self.daily_truck_button.configure(font=self.font_normal)
             self.non_shipping_button.configure(font=self.font_normal)
             self.safety_stock_button.configure(font=self.font_normal)
@@ -1501,43 +1484,70 @@ class ProductionPlannerApp(ctk.CTk):
         messagebox.showinfo("성공", message)
         logging.info(message)
         
+    # ◀◀◀ [수정됨] 엑셀 내보내기 기능 전체 재작성
     def export_to_excel(self):
-        if self.current_step < 1:
-            messagebox.showwarning("오류", "먼저 데이터를 불러와야 합니다.")
+        if self.current_step < 2:
+            messagebox.showwarning("오류", "먼저 '재고 반영 및 계획 시뮬레이션'을 실행해야 합니다.")
             return
+            
         start_date = self.processor.date_cols[0].strftime('%m-%d')
         end_date = self.processor.date_cols[-1].strftime('%m-%d')
-        filename = f"{start_date}~{end_date} {'생산계획' if self.current_step == 1 else '출고계획'}.xlsx"
+        filename = f"{start_date}~{end_date} 출고계획.xlsx"
         file_path = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile=filename, filetypes=(("Excel", "*.xlsx"),))
         if not file_path: return
+
         self.update_status_bar(f"'{os.path.basename(file_path)}' 파일로 내보내는 중입니다...")
-        
+
         def worker():
             try:
+                df = self.processor.simulated_plan_df
+                shipment_cols = [c for c in df.columns if isinstance(c, str) and c.startswith('출고_')]
+                
+                # 1. 데이터 재구성 (MultiIndex 생성)
+                multi_index_cols = []
+                for col_name in shipment_cols:
+                    parts = col_name.split('_')
+                    truck_num_str = parts[1]
+                    date_str = parts[2]
+                    # 날짜 형식 변경 (MMDD -> MM-DD)
+                    formatted_date = f"{date_str[:2]}-{date_str[2:]}"
+                    multi_index_cols.append((formatted_date, truck_num_str))
+
+                shipment_df = df[shipment_cols].copy()
+                shipment_df.columns = pd.MultiIndex.from_tuples(multi_index_cols, names=['날짜', '차수'])
+
+                # 2. 출고량 0인 열(날짜-차수 조합) 제거
+                shipment_df = shipment_df.loc[:, shipment_df.sum() > 0]
+                
+                # 3. Item.csv 순서대로 정렬 및 출고량 없는 품목 제거
+                sorted_models = self.processor.item_master_df.index
+                shipment_df = shipment_df.reindex(sorted_models).dropna(how='all')
+                
                 with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-                    if self.current_step == 1:
-                        df = self.processor.aggregated_plan_df
-                        df_filtered = df[df[self.processor.date_cols].sum(axis=1) > 0]
-                        df_filtered.to_excel(writer, sheet_name='생산계획')
-                    else:
-                        df = self.processor.simulated_plan_df
-                        shipment_cols = [c for c in df.columns if isinstance(c, str) and c.startswith('출고_')]
-                        df_filtered = df[df[shipment_cols].sum(axis=1) > 0]
-                        df_filtered.to_excel(writer, sheet_name='Full Plan')
-                        all_truck_nums = sorted(list(set(int(c.split('_')[1][:-1]) for c in shipment_cols)))
-                        for truck_num in all_truck_nums:
-                            sheet_name = f'{truck_num}차 출고'
-                            cols_for_truck = [f'출고_{truck_num}차_{d.strftime("%m%d")}' for d in self.processor.date_cols if f'출고_{truck_num}차_{d.strftime("%m%d")}' in df.columns]
-                            if not cols_for_truck: continue
-                            df_truck = df_filtered[cols_for_truck].copy()
-                            df_truck.columns = [c[-4:] for c in cols_for_truck]
-                            df_truck = df_truck.rename(columns=lambda x: f"{x[:2]}-{x[2:]}")
-                            df_truck[df_truck.sum(axis=1) > 0].to_excel(writer, sheet_name=sheet_name)
+                    # '출고 계획' 시트 저장
+                    shipment_df.to_excel(writer, sheet_name='출고 계획')
+                    
+                    # 4. HMC 품목 하이라이트 적용
+                    workbook = writer.book
+                    worksheet = writer.sheets['출고 계획']
+                    blue_fill = PatternFill(start_color="D6EAF8", end_color="D6EAF8", fill_type="solid")
+                    
+                    # 헤더가 2줄이므로 데이터는 3번째 행부터 시작
+                    header_rows = 2
+                    for r_idx, model_name in enumerate(shipment_df.index):
+                        if model_name in self.processor.highlight_models:
+                            # openpyxl은 1-based index 사용 (데이터 행 + 헤더 행)
+                            row_to_format = worksheet[r_idx + 1 + header_rows]
+                            for cell in row_to_format:
+                                cell.fill = blue_fill
+
                 self.thread_queue.put(("export_done", file_path))
             except Exception as e:
                 self.thread_queue.put(("error", f"내보내기 실패: {e}"))
+
         self.run_in_thread(worker)
 
+    # (filter_grid, populate_master_grid_from_scratch 등 나머지 메서드는 이전과 동일)
     def filter_grid(self, event=None):
         df_source = self.processor.aggregated_plan_df if self.current_step == 1 else self.processor.simulated_plan_df
         if df_source is None:

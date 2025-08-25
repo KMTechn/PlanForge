@@ -2,7 +2,7 @@
     "PALLET_SIZE": 60,
     "LEAD_TIME_DAYS": 2,
     "PALLETS_PER_TRUCK": 36,
-    "MAX_TRUCKS_PER_DAY": 2,
+    "MAX_TRUCKS_PER_DAY": 3,
     "FONT_SIZE": 24,
     "DELIVERY_DAYS": {
         "0": "True",
