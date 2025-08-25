@@ -1,0 +1,18 @@
+{
+    "PALLET_SIZE": 60,
+    "LEAD_TIME_DAYS": 2,
+    "PALLETS_PER_TRUCK": 36,
+    "MAX_TRUCKS_PER_DAY": 2,
+    "FONT_SIZE": 24,
+    "DELIVERY_DAYS": {
+        "0": "True",
+        "1": "True",
+        "2": "True",
+        "3": "True",
+        "4": "True",
+        "5": "False",
+        "6": "False"
+    },
+    "NON_SHIPPING_DATES": [],
+    "DAILY_TRUCK_OVERRIDES": {}
+}

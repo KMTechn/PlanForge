@@ -18,6 +18,7 @@ import zipfile
 import subprocess
 import threading
 from queue import Queue, Empty
+import json
 
 # ===================================================================
 # PyInstaller 빌드 환경을 위한 리소스 경로 설정 함수 (★ 수정된 부분)
@@ -28,7 +29,8 @@ def resource_path(relative_path):
         # PyInstaller는 임시 폴더를 생성하고 _MEIPASS에 경로를 저장합니다.
         base_path = sys._MEIPASS
     except Exception:
-        base_path = os.path.abspath(".")
+        # ◀◀◀ [수정됨] 스크립트 파일의 실제 위치를 기준으로 경로를 설정합니다.
+        base_path = os.path.dirname(os.path.abspath(__file__))
 
     return os.path.join(base_path, relative_path)
 
@@ -166,18 +168,56 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 class ConfigManager:
     def __init__(self):
-        # config.xlsx 파일을 읽는 대신, 모든 설정값을 코드 내에 직접 정의합니다.
-        self.config = {
+        self.config_filepath = resource_path('config.json')
+        self.config = self.load_config()
+
+    def get_default_config(self):
+        """설정 파일이 없을 때 사용할 기본값을 반환합니다."""
+        return {
             'PALLET_SIZE': 60,
             'LEAD_TIME_DAYS': 2,
             'PALLETS_PER_TRUCK': 36,
             'MAX_TRUCKS_PER_DAY': 2,
             'FONT_SIZE': 11,
-            'DELIVERY_DAYS': {str(i): 'True' if i < 5 else 'False' for i in range(7)}, # 월~금 납품
+            'DELIVERY_DAYS': {str(i): 'True' if i < 5 else 'False' for i in range(7)},
             'NON_SHIPPING_DATES': [],
             'DAILY_TRUCK_OVERRIDES': {}
         }
-        logging.info("기본 설정값을 로드했습니다.")
+
+    def load_config(self):
+        """JSON 파일에서 설정을 로드합니다."""
+        try:
+            with open(self.config_filepath, 'r', encoding='utf-8') as f:
+                loaded_config = json.load(f)
+                logging.info(f"{self.config_filepath}에서 설정을 로드했습니다.")
+                
+                default_config = self.get_default_config()
+                for key, value in default_config.items():
+                    if key not in loaded_config:
+                        loaded_config[key] = value
+
+                loaded_config['NON_SHIPPING_DATES'] = [datetime.datetime.strptime(d, '%Y-%m-%d').date() for d in loaded_config.get('NON_SHIPPING_DATES', [])]
+                loaded_config['DAILY_TRUCK_OVERRIDES'] = {datetime.datetime.strptime(k, '%Y-%m-%d').date(): v for k, v in loaded_config.get('DAILY_TRUCK_OVERRIDES', {}).items()}
+                
+                return loaded_config
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.warning(f"설정 파일을 찾을 수 없거나 오류가 있어 기본값을 사용합니다: {e}")
+            return self.get_default_config()
+
+    def save_config(self):
+        """현재 설정을 JSON 파일에 저장합니다."""
+        try:
+            config_to_save = self.config.copy()
+            
+            config_to_save['NON_SHIPPING_DATES'] = [d.strftime('%Y-%m-%d') for d in config_to_save.get('NON_SHIPPING_DATES', [])]
+            config_to_save['DAILY_TRUCK_OVERRIDES'] = {k.strftime('%Y-%m-%d'): v for k, v in config_to_save.get('DAILY_TRUCK_OVERRIDES', {}).items()}
+            
+            with open(self.config_filepath, 'w', encoding='utf-8') as f:
+                json.dump(config_to_save, f, ensure_ascii=False, indent=4)
+            logging.info(f"설정을 {self.config_filepath}에 저장했습니다.")
+        except Exception as e:
+            logging.error(f"설정 파일 저장 실패: {e}")
+            messagebox.showwarning("저장 오류", f"설정 파일 저장 중 오류가 발생했습니다:\n{e}")
 
 class PlanProcessor:
     def __init__(self, config):
@@ -194,12 +234,11 @@ class PlanProcessor:
         self.item_master_df = None
         self.allowed_models = []
         self.highlight_models = []
-        self.unmet_demand_log = [] # '계획 실패' 경고를 위한 로그
+        self.unmet_demand_log = [] 
         self._load_item_master()
 
     def _load_item_master(self):
         try:
-            # ★★★ 수정된 부분 ★★★
             self.item_path = resource_path('assets/Item.csv')
             if not os.path.exists(self.item_path):
                 raise FileNotFoundError(f"assets/Item.csv 파일을 찾을 수 없습니다. (경로: {self.item_path})")
@@ -345,7 +384,7 @@ class PlanProcessor:
         self.adjustments = adjustments if adjustments else []
         self.fixed_shipments = fixed_shipments if fixed_shipments else []
         self.fixed_shipment_reqs = fixed_shipment_reqs if fixed_shipment_reqs else []
-        self.unmet_demand_log = [] # 시뮬레이션 시작 시 로그 초기화
+        self.unmet_demand_log = [] 
 
         if self.aggregated_plan_df is None: return
 
@@ -392,7 +431,6 @@ class PlanProcessor:
             total_shipments_today = pd.Series(0, index=plan_df.index, dtype=np.int64)
 
             if is_shipping_day and not is_non_shipping_date:
-                # TIER 1: 필수 출고량 (Must-Ship)
                 required_for_lead_time = rolling_demand[date] - current_inventory + safety_stock
                 short_term_days = 7
                 end_short_term = date + pd.Timedelta(days=short_term_days)
@@ -401,7 +439,6 @@ class PlanProcessor:
                 must_ship_demand = pd.concat([required_for_lead_time, required_for_short_term], axis=1).max(axis=1)
                 must_ship_demand[must_ship_demand < 0] = 0
 
-                # TIER 2: 선제적 출고 가능량 (Pull-Forward)
                 long_term_days = 30
                 end_long_term = date + pd.Timedelta(days=long_term_days)
                 long_term_dates = [d for d in simulation_dates if end_short_term <= d < end_long_term]
@@ -414,7 +451,6 @@ class PlanProcessor:
                 
                 must_ship_demand = pd.concat([must_ship_demand, fixed_reqs_today], axis=1).max(axis=1).astype(np.int64)
 
-                # 트럭 적재 로직
                 fixed_shipments_today = pd.DataFrame(0, index=plan_df.index, columns=range(1, daily_max_trucks + 1), dtype=np.int64)
                 truck_capacity_remains = pd.Series(truck_capacity, index=range(1, daily_max_trucks + 1), dtype=np.int64)
                 
@@ -445,7 +481,7 @@ class PlanProcessor:
                                 auto_shipments_today.loc[model, truck_num] += qty_to_ship
                                 truck_capacity_remains[truck_num] -= qty_to_ship
                                 remaining_must_ship.loc[model] -= qty_to_ship
-                        
+                            
                     for model in priority_models:
                         if truck_capacity_remains[truck_num] < pallet_size: break
                         if remaining_pull_forward.loc[model] > 0:
@@ -674,7 +710,6 @@ class AdjustmentDialog(ctk.CTkToplevel):
     def cancel_event(self):
         self.result = None
         self.destroy()
-
 
 class InventoryInputDialog(ctk.CTkToplevel):
     def __init__(self, parent):
@@ -961,6 +996,7 @@ class ProductionPlannerApp(ctk.CTk):
 
         run_updater(REPO_OWNER, REPO_NAME, CURRENT_VERSION)
         
+        self.set_font_size(self.base_font_size)
         self.after(100, self.process_thread_queue)
     
     def process_thread_queue(self):
@@ -1015,6 +1051,7 @@ class ProductionPlannerApp(ctk.CTk):
 
     def on_closing(self):
         try:
+            self.config_manager.save_config() 
             self.unbind_all("<Control-MouseWheel>")
             plt.close('all')
             if messagebox.askokcancel("종료", "프로그램을 종료하시겠습니까?"):
@@ -1049,24 +1086,25 @@ class ProductionPlannerApp(ctk.CTk):
         self.font_plus_button.configure(font=self.font_normal)
         self.settings_title_label.configure(font=self.font_bold)
         
-        for label in self.setting_labels:
-            label.configure(font=self.font_normal)
-        for entry in self.settings_entries.values():
-            entry.configure(font=self.font_normal)
-        for cb in self.day_checkboxes.values():
-            cb.configure(font=self.font_normal)
+        if hasattr(self, 'setting_labels'):
+            for label in self.setting_labels:
+                label.configure(font=self.font_normal)
+            for entry in self.settings_entries.values():
+                entry.configure(font=self.font_normal)
+            for cb in self.day_checkboxes.values():
+                cb.configure(font=self.font_normal)
             
-        self.daily_truck_button.configure(font=self.font_normal)
-        self.non_shipping_button.configure(font=self.font_normal)
-        self.safety_stock_button.configure(font=self.font_normal)
-        self.save_settings_button.configure(font=self.font_normal)
-        self.search_label.configure(font=self.font_normal)
-        self.search_entry.configure(font=self.font_normal)
-        self.lbl_models_found.configure(font=self.font_kpi)
-        self.lbl_total_quantity.configure(font=self.font_kpi)
-        self.lbl_date_range.configure(font=self.font_kpi)
-        self.detail_tab_title.configure(font=self.font_bold)
-        self.status_bar.configure(font=self.font_normal)
+            self.daily_truck_button.configure(font=self.font_normal)
+            self.non_shipping_button.configure(font=self.font_normal)
+            self.safety_stock_button.configure(font=self.font_normal)
+            self.save_settings_button.configure(font=self.font_normal)
+            self.search_label.configure(font=self.font_normal)
+            self.search_entry.configure(font=self.font_normal)
+            self.lbl_models_found.configure(font=self.font_kpi)
+            self.lbl_total_quantity.configure(font=self.font_kpi)
+            self.lbl_date_range.configure(font=self.font_kpi)
+            self.detail_tab_title.configure(font=self.font_bold)
+            self.status_bar.configure(font=self.font_normal)
 
         if self.current_step > 0:
             self.filter_grid()
@@ -1123,7 +1161,7 @@ class ProductionPlannerApp(ctk.CTk):
         main_area_frame = ctk.CTkFrame(main_content_container, fg_color="transparent")
         main_area_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         main_area_frame.grid_columnconfigure(0, weight=1)
-        main_area_frame.grid_rowconfigure(3, weight=1) # Row index changed for new frame
+        main_area_frame.grid_rowconfigure(3, weight=1)
 
         self.sidebar_title = ctk.CTkLabel(self.sidebar_frame, text="PlanForge Pro", font=self.font_big_bold)
         self.sidebar_title.pack(pady=20)
@@ -1216,7 +1254,6 @@ class ProductionPlannerApp(ctk.CTk):
         self.lbl_date_range = ctk.CTkLabel(self.kpi_frame, text="계획 기간: -", font=self.font_kpi)
         self.lbl_date_range.grid(row=0, column=2, padx=10, pady=10)
         
-        # --- 경고 프레임 영역 수정 ---
         self.unmet_demand_frame = ctk.CTkFrame(main_area_frame, fg_color="#FFDDE1")
         self.unmet_demand_frame.grid(row=1, column=0, sticky="ew", pady=(5,0))
         self.unmet_demand_frame.grid_remove()
@@ -1234,7 +1271,7 @@ class ProductionPlannerApp(ctk.CTk):
         self.shortage_list_frame.pack(fill="x", expand=True, padx=5, pady=5)
         
         self.tabview = ctk.CTkTabview(main_area_frame)
-        self.tabview.grid(row=3, column=0, sticky="nsew") # Row index changed
+        self.tabview.grid(row=3, column=0, sticky="nsew") 
         self.master_tab = self.tabview.add("개요")
         self.detail_tab = self.tabview.add("상세")
         self.master_tab.grid_columnconfigure(0, weight=1)
@@ -1331,7 +1368,7 @@ class ProductionPlannerApp(ctk.CTk):
         self.filter_grid()
         self.update_status_bar("2단계: 출고 계획 시뮬레이션 완료.")
         self.check_shipment_capacity()
-        self.update_unmet_demand_warnings() # 계획 실패 경고 업데이트
+        self.update_unmet_demand_warnings() 
         self.update_shortage_warnings()
         logging.info("2단계 완료. 시뮬레이션 결과 UI 업데이트 완료.")
 
@@ -1362,7 +1399,7 @@ class ProductionPlannerApp(ctk.CTk):
         self.filter_grid()
         self.update_status_bar("3단계: 수동 조정 적용 완료.")
         self.check_shipment_capacity()
-        self.update_unmet_demand_warnings() # 계획 실패 경고 업데이트
+        self.update_unmet_demand_warnings() 
         self.update_shortage_warnings()
         logging.info("3단계 완료. 조정 결과 UI 업데이트 완료.")
     
@@ -1386,7 +1423,6 @@ class ProductionPlannerApp(ctk.CTk):
                     if self.inventory_text_backup: self.processor.load_inventory_from_text(self.inventory_text_backup)
                     self.processor.run_simulation(adjustments=self.processor.adjustments, fixed_shipments=self.processor.fixed_shipments, fixed_shipment_reqs=self.processor.fixed_shipment_reqs)
                     
-                    # 1순위: 계획 실패(필수 물량 부족) 해결
                     if self.processor.unmet_demand_log:
                         first_failure = self.processor.unmet_demand_log[0]
                         shipping_date = first_failure['date']
@@ -1397,9 +1433,8 @@ class ProductionPlannerApp(ctk.CTk):
                         new_max = current_max + 1
                         self.processor.config['DAILY_TRUCK_OVERRIDES'][shipping_date] = new_max
                         logging.info(f"안정화 {i+1}단계: {shipping_date} 필수물량 부족 해결 위해 차수를 {new_max}로 증가")
-                        continue # 다음 루프에서 재시도
+                        continue 
                     
-                    # 2순위: 안전 재고 부족 해결
                     found_shortage, fix_info = self.processor.find_and_propose_fix(max_truck_limit=max_truck_limit_per_day)
                     if not found_shortage:
                         msg = f"재고 안정화 완료! ({i}회 반복)" if i > 0 else "현재 계획은 안정적입니다."
@@ -1444,8 +1479,9 @@ class ProductionPlannerApp(ctk.CTk):
 
         def worker():
             try:
-                # self.config_manager.save_config(new_config) # 파일 저장은 더이상 하지 않음
                 self.processor.config = new_config
+                self.config_manager.config = new_config 
+                self.config_manager.save_config() 
                 if self.current_step >= 1: self.processor.process_plan_file()
                 if self.current_step >= 2:
                     if self.inventory_text_backup: self.processor.load_inventory_from_text(self.inventory_text_backup)
