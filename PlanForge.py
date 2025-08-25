@@ -63,7 +63,7 @@ def resource_path(relative_path):
 # ===================================================================
 REPO_OWNER = "KMTechn"
 REPO_NAME = "PlanForge"
-CURRENT_VERSION = "v1.0.0" # 버전 업데이트
+CURRENT_VERSION = "v1.0.1" # 버전 업데이트
 # ===================================================================
 
 # 자동 업데이트 기능 함수
