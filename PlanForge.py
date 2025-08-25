@@ -19,35 +19,28 @@ import subprocess
 import threading
 from queue import Queue, Empty
 import json
-from openpyxl.styles import PatternFill # ◀◀◀ [추가됨] 엑셀 서식을 위한 라이브러리
+# ◀◀◀ [수정됨] 엑셀 서식을 위한 Border, Side 라이브러리 추가
+from openpyxl.styles import PatternFill, Font, Border, Side
 
 # ===================================================================
-# PyInstaller 빌드 환경을 위한 리소스 경로 설정 함수 (★ 수정된 부분)
+# PyInstaller 빌드 환경을 위한 리소스 경로 설정 함수
 # ===================================================================
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller는 임시 폴더를 생성하고 _MEIPASS에 경로를 저장합니다.
         base_path = sys._MEIPASS
     except Exception:
-        # ◀◀◀ [수정됨] 스크립트 파일의 실제 위치를 기준으로 경로를 설정합니다.
         base_path = os.path.dirname(os.path.abspath(__file__))
-
     return os.path.join(base_path, relative_path)
-
-# --- Business Logic & Workflow ---
-# (비즈니스 로직 설명은 이전과 동일)
-# -----------------------------------------
 
 # ===================================================================
 # GitHub 자동 업데이트 설정
 # ===================================================================
 REPO_OWNER = "KMTechn"
 REPO_NAME = "PlanForge"
-CURRENT_VERSION = "v1.0.1" # 버전 업데이트
-# ===================================================================
+CURRENT_VERSION = "v1.0.0"
 
-# 자동 업데이트 기능 함수 (이전과 동일)
+# 자동 업데이트 기능 함수
 def check_for_updates(repo_owner: str, repo_name: str, current_version: str):
     logging.info("Checking for updates...")
     try:
@@ -148,13 +141,11 @@ plt.rcParams['axes.unicode_minus'] = False
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ConfigManager:
-    # ... (이전과 동일)
     def __init__(self):
         self.config_filepath = resource_path('config.json')
         self.config = self.load_config()
 
     def get_default_config(self):
-        """설정 파일이 없을 때 사용할 기본값을 반환합니다."""
         return {
             'PALLET_SIZE': 60,
             'LEAD_TIME_DAYS': 2,
@@ -167,7 +158,6 @@ class ConfigManager:
         }
 
     def load_config(self):
-        """JSON 파일에서 설정을 로드합니다."""
         try:
             with open(self.config_filepath, 'r', encoding='utf-8') as f:
                 loaded_config = json.load(f)
@@ -187,7 +177,6 @@ class ConfigManager:
             return self.get_default_config()
 
     def save_config(self):
-        """현재 설정을 JSON 파일에 저장합니다."""
         try:
             config_to_save = self.config.copy()
             
@@ -202,7 +191,6 @@ class ConfigManager:
             messagebox.showwarning("저장 오류", f"설정 파일 저장 중 오류가 발생했습니다:\n{e}")
 
 class PlanProcessor:
-    # ... (이전과 동일)
     def __init__(self, config):
         self.config = config
         self.aggregated_plan_df = None
@@ -236,7 +224,13 @@ class PlanProcessor:
             else:
                 self.item_master_df['SafetyStock'] = pd.to_numeric(self.item_master_df['SafetyStock'], errors='coerce').fillna(0).astype(int)
 
-            self.item_master_df.sort_values(by='Priority', inplace=True)
+            if 'Spec' in self.item_master_df.columns:
+                self.item_master_df['is_hmc'] = self.item_master_df['Spec'].str.contains('HMC', na=False)
+                self.item_master_df.sort_values(by=['is_hmc', 'Priority'], ascending=[False, True], inplace=True)
+                self.item_master_df.drop(columns=['is_hmc'], inplace=True)
+            else:
+                self.item_master_df.sort_values(by='Priority', inplace=True)
+
             self.allowed_models = self.item_master_df['Item Code'].tolist()
             self.highlight_models = self.item_master_df[self.item_master_df['Spec'].str.contains('HMC', na=False)]['Item Code'].tolist()
             
@@ -251,8 +245,9 @@ class PlanProcessor:
     def save_item_master(self):
         try:
             df_to_save = self.item_master_df.reset_index()
-            df_to_save.to_csv(self.item_path, index=False)
-            logging.info(f"품목 정보(최소 재고 포함)를 {self.item_path}에 저장했습니다.")
+            df_to_save.sort_values(by='Priority', inplace=True)
+            df_to_save.to_csv(self.item_path, index=False, encoding='utf-8-sig')
+            logging.info(f"품목 정보를 {self.item_path}에 저장했습니다.")
         except Exception as e:
             messagebox.showerror("품목 정보 저장 실패", f"Item.csv 파일 저장 중 오류 발생: {e}")
             logging.error(f"Item.csv 저장 실패: {e}")
@@ -283,7 +278,9 @@ class PlanProcessor:
             
             df_filtered.loc[:, self.date_cols] = df_filtered.loc[:, self.date_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
             agg_df = df_filtered.groupby('Model')[self.date_cols].sum()
-            reindexed_df = agg_df.reindex(self.allowed_models).fillna(0).astype(int)
+            
+            sorted_models = self.item_master_df.index
+            reindexed_df = agg_df.reindex(sorted_models).fillna(0).astype(int)
             
             self.aggregated_plan_df = reindexed_df.copy()
             logging.info(f"최종 집계된 DataFrame 생성 (shape: {self.aggregated_plan_df.shape})")
@@ -464,7 +461,7 @@ class PlanProcessor:
                                 auto_shipments_today.loc[model, truck_num] += qty_to_ship
                                 truck_capacity_remains[truck_num] -= qty_to_ship
                                 remaining_must_ship.loc[model] -= qty_to_ship
-                            
+                                
                     for model in priority_models:
                         if truck_capacity_remains[truck_num] < pallet_size: break
                         if remaining_pull_forward.loc[model] > 0:
@@ -571,7 +568,7 @@ class PlanProcessor:
         
         return True, fix_details
 
-# --- 위젯 클래스 (이전과 동일) ---
+# --- 위젯 클래스 ---
 class SearchableComboBox(ctk.CTkFrame):
     def __init__(self, parent, values):
         super().__init__(parent, fg_color="transparent")
@@ -941,8 +938,102 @@ class SafetyStockDialog(ctk.CTkToplevel):
         self.result = None
         self.destroy()
 
+class ItemOrderDialog(ctk.CTkToplevel):
+    def __init__(self, parent, item_list, highlight_items):
+        super().__init__(parent)
+        self.title("품목 표시 순서 설정")
+        self.geometry("400x600")
+        self.result = None
+        
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        main_frame = ctk.CTkFrame(self)
+        main_frame.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+        main_frame.grid_columnconfigure(0, weight=1)
+        main_frame.grid_rowconfigure(0, weight=1)
+
+        self.listbox = Listbox(main_frame, selectmode=tk.SINGLE, font=("Malgun Gothic", 12))
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        
+        for item in item_list:
+            self.listbox.insert(END, item)
+        
+        for i in range(self.listbox.size()):
+            item = self.listbox.get(i)
+            if item in highlight_items:
+                self.listbox.itemconfig(i, {'bg':'#D6EAF8', 'fg':'#154360'})
+
+        button_frame = ctk.CTkFrame(self, fg_color="transparent")
+        button_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        button_frame.grid_columnconfigure((0,1,2,3), weight=1)
+
+        ctk.CTkButton(button_frame, text="▲ 맨 위로", command=self.move_top).grid(row=0, column=0, padx=2, pady=2)
+        ctk.CTkButton(button_frame, text="△ 위로", command=self.move_up).grid(row=0, column=1, padx=2, pady=2)
+        ctk.CTkButton(button_frame, text="▽ 아래로", command=self.move_down).grid(row=0, column=2, padx=2, pady=2)
+        ctk.CTkButton(button_frame, text="▼ 맨 아래로", command=self.move_bottom).grid(row=0, column=3, padx=2, pady=2)
+
+        ok_cancel_frame = ctk.CTkFrame(self, fg_color="transparent")
+        ok_cancel_frame.grid(row=2, column=0, sticky="e", padx=10, pady=10)
+        ctk.CTkButton(ok_cancel_frame, text="저장", command=self.save_order).pack(side="left", padx=5)
+        ctk.CTkButton(ok_cancel_frame, text="취소", command=self.cancel, fg_color="gray").pack(side="left")
+
+        self.transient(parent)
+        self.grab_set()
+
+    def move_up(self):
+        try:
+            idx = self.listbox.curselection()[0]
+            if idx > 0:
+                item = self.listbox.get(idx)
+                self.listbox.delete(idx)
+                self.listbox.insert(idx - 1, item)
+                self.listbox.selection_set(idx - 1)
+        except IndexError:
+            pass 
+
+    def move_down(self):
+        try:
+            idx = self.listbox.curselection()[0]
+            if idx < self.listbox.size() - 1:
+                item = self.listbox.get(idx)
+                self.listbox.delete(idx)
+                self.listbox.insert(idx + 1, item)
+                self.listbox.selection_set(idx + 1)
+        except IndexError:
+            pass
+
+    def move_top(self):
+        try:
+            idx = self.listbox.curselection()[0]
+            if idx > 0:
+                item = self.listbox.get(idx)
+                self.listbox.delete(idx)
+                self.listbox.insert(0, item)
+                self.listbox.selection_set(0)
+        except IndexError:
+            pass
+
+    def move_bottom(self):
+        try:
+            idx = self.listbox.curselection()[0]
+            if idx < self.listbox.size() - 1:
+                item = self.listbox.get(idx)
+                self.listbox.delete(idx)
+                self.listbox.insert(END, item)
+                self.listbox.selection_set(END)
+        except IndexError:
+            pass
+
+    def save_order(self):
+        self.result = list(self.listbox.get(0, END))
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
 class ProductionPlannerApp(ctk.CTk):
-    # ... (__init__ 등 다른 메서드는 이전과 동일)
     def __init__(self, config_manager):
         super().__init__()
         self.config_manager = config_manager
@@ -1029,6 +1120,8 @@ class ProductionPlannerApp(ctk.CTk):
         self.daily_truck_button.configure(state=state)
         self.non_shipping_button.configure(state=state)
         self.safety_stock_button.configure(state=state)
+        if hasattr(self, 'item_order_button'):
+            self.item_order_button.configure(state=state)
         if not is_running:
             self.update_status_bar()
 
@@ -1080,6 +1173,7 @@ class ProductionPlannerApp(ctk.CTk):
             self.daily_truck_button.configure(font=self.font_normal)
             self.non_shipping_button.configure(font=self.font_normal)
             self.safety_stock_button.configure(font=self.font_normal)
+            self.item_order_button.configure(font=self.font_normal)
             self.save_settings_button.configure(font=self.font_normal)
             self.search_label.configure(font=self.font_normal)
             self.search_entry.configure(font=self.font_normal)
@@ -1150,7 +1244,7 @@ class ProductionPlannerApp(ctk.CTk):
         self.sidebar_title.pack(pady=20)
         self.step1_button = ctk.CTkButton(self.sidebar_frame, text="1. 생산계획 불러오기", command=self.run_step1_aggregate, font=self.font_normal)
         self.step1_button.pack(fill='x', padx=20, pady=5)
-        self.step2_button = ctk.CTkButton(self.sidebar_frame, text="2. 재고 반영 및 계획 시뮬레이션", command=self.run_step2_simulation, state="disabled", font=self.font_normal)
+        self.step2_button = ctk.CTkButton(self.sidebar_frame, text="2. 재고 반영", command=self.run_step2_simulation, state="disabled", font=self.font_normal)
         self.step2_button.pack(fill='x', padx=20, pady=5)
         self.step3_button = ctk.CTkButton(self.sidebar_frame, text="3. 수동 조정 적용", command=self.run_step3_adjustments, state="disabled", font=self.font_normal)
         self.step3_button.pack(fill='x', padx=20, pady=5)
@@ -1212,6 +1306,9 @@ class ProductionPlannerApp(ctk.CTk):
         
         self.safety_stock_button = ctk.CTkButton(settings_frame, text="품목별 최소 재고 설정", command=self.open_safety_stock_dialog, font=self.font_normal)
         self.safety_stock_button.pack(fill='x', padx=5, pady=5)
+
+        self.item_order_button = ctk.CTkButton(settings_frame, text="품목 순서 변경", command=self.open_item_order_dialog, font=self.font_normal)
+        self.item_order_button.pack(fill='x', padx=5, pady=5)
 
         self.save_settings_button = ctk.CTkButton(self.sidebar_frame, text="설정 저장 및 재계산", command=self.save_settings_and_recalculate, fg_color="#1F6AA5", font=self.font_normal)
         self.save_settings_button.pack(fill='x', padx=20, pady=10, side='bottom')
@@ -1484,7 +1581,6 @@ class ProductionPlannerApp(ctk.CTk):
         messagebox.showinfo("성공", message)
         logging.info(message)
         
-    # ◀◀◀ [수정됨] 엑셀 내보내기 기능 전체 재작성
     def export_to_excel(self):
         if self.current_step < 2:
             messagebox.showwarning("오류", "먼저 '재고 반영 및 계획 시뮬레이션'을 실행해야 합니다.")
@@ -1503,51 +1599,86 @@ class ProductionPlannerApp(ctk.CTk):
                 df = self.processor.simulated_plan_df
                 shipment_cols = [c for c in df.columns if isinstance(c, str) and c.startswith('출고_')]
                 
-                # 1. 데이터 재구성 (MultiIndex 생성)
                 multi_index_cols = []
                 for col_name in shipment_cols:
                     parts = col_name.split('_')
                     truck_num_str = parts[1]
                     date_str = parts[2]
-                    # 날짜 형식 변경 (MMDD -> MM-DD)
                     formatted_date = f"{date_str[:2]}-{date_str[2:]}"
                     multi_index_cols.append((formatted_date, truck_num_str))
 
                 shipment_df = df[shipment_cols].copy()
                 shipment_df.columns = pd.MultiIndex.from_tuples(multi_index_cols, names=['날짜', '차수'])
 
-                # 2. 출고량 0인 열(날짜-차수 조합) 제거
                 shipment_df = shipment_df.loc[:, shipment_df.sum() > 0]
+                shipment_df = shipment_df.loc[shipment_df.sum(axis=1) > 0]
                 
-                # 3. Item.csv 순서대로 정렬 및 출고량 없는 품목 제거
                 sorted_models = self.processor.item_master_df.index
-                shipment_df = shipment_df.reindex(sorted_models).dropna(how='all')
+                shipment_df = shipment_df.reindex(index=sorted_models).dropna(how='all')
                 
                 with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-                    # '출고 계획' 시트 저장
                     shipment_df.to_excel(writer, sheet_name='출고 계획')
                     
-                    # 4. HMC 품목 하이라이트 적용
                     workbook = writer.book
                     worksheet = writer.sheets['출고 계획']
-                    blue_fill = PatternFill(start_color="D6EAF8", end_color="D6EAF8", fill_type="solid")
+
+                    max_length = 0
+                    for cell in worksheet['A']:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = (max_length + 5)
+                    worksheet.column_dimensions['A'].width = adjusted_width
                     
-                    # 헤더가 2줄이므로 데이터는 3번째 행부터 시작
+                    blue_fill = PatternFill(start_color="D6EAF8", end_color="D6EAF8", fill_type="solid")
                     header_rows = 2
                     for r_idx, model_name in enumerate(shipment_df.index):
                         if model_name in self.processor.highlight_models:
-                            # openpyxl은 1-based index 사용 (데이터 행 + 헤더 행)
                             row_to_format = worksheet[r_idx + 1 + header_rows]
                             for cell in row_to_format:
                                 cell.fill = blue_fill
 
+                    if not shipment_df.empty:
+                        pallet_size = self.processor.config.get('PALLET_SIZE', 60)
+                        
+                        total_pcs = shipment_df.sum()
+                        
+                        pallet_df = np.ceil(shipment_df / pallet_size).where(shipment_df > 0, 0)
+                        total_pallets = pallet_df.sum().astype(int)
+
+                        bold_font = Font(bold=True)
+                        
+                        summary_start_row = len(shipment_df) + 4
+
+                        pcs_label_cell = worksheet.cell(row=summary_start_row, column=1, value="합계 (PCS)")
+                        pcs_label_cell.font = bold_font
+                        for i, total in enumerate(total_pcs):
+                            cell = worksheet.cell(row=summary_start_row, column=i + 2, value=total)
+                            cell.font = bold_font
+
+                        pallet_label_cell = worksheet.cell(row=summary_start_row + 1, column=1, value="합계 (Pallet)")
+                        pallet_label_cell.font = bold_font
+                        for i, total in enumerate(total_pallets):
+                            cell = worksheet.cell(row=summary_start_row + 1, column=i + 2, value=total)
+                            cell.font = bold_font
+
+                    # ◀◀◀ [추가됨] 모든 셀에 테두리 적용
+                    thin_border_side = Side(border_style="thin", color="000000")
+                    thin_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+                    
+                    for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+                        for cell in row:
+                            cell.border = thin_border
+
                 self.thread_queue.put(("export_done", file_path))
             except Exception as e:
+                logging.exception("엑셀 내보내기 중 오류 발생")
                 self.thread_queue.put(("error", f"내보내기 실패: {e}"))
 
         self.run_in_thread(worker)
 
-    # (filter_grid, populate_master_grid_from_scratch 등 나머지 메서드는 이전과 동일)
     def filter_grid(self, event=None):
         df_source = self.processor.aggregated_plan_df if self.current_step == 1 else self.processor.simulated_plan_df
         if df_source is None:
@@ -1580,11 +1711,11 @@ class ProductionPlannerApp(ctk.CTk):
 
         if self.current_step < 2:
             df_display = df_to_show.reset_index()
-            headers = ['Model'] + [d.strftime('%m-%d') for d in display_cols]
+            headers = ['Item Code'] + [d.strftime('%m-%d') for d in display_cols]
             for c, h_text in enumerate(headers):
                 ctk.CTkLabel(self.master_frame, text=h_text, font=self.font_header).grid(row=0, column=c, sticky="ew", padx=1, pady=2)
             for r, row_data in df_display.iterrows():
-                model = row_data['Model']
+                model = row_data['Item Code']
                 bg = "#D6EAF8" if model in self.processor.highlight_models else "transparent"
                 lbl_model = ctk.CTkLabel(self.master_frame, text=model, fg_color=bg, font=self.font_normal, anchor="w", padx=5)
                 lbl_model.grid(row=r + 1, column=0, sticky="ew")
@@ -1610,7 +1741,7 @@ class ProductionPlannerApp(ctk.CTk):
                 if active_trucks:
                     active_trucks_per_day[d.date()] = active_trucks
             
-            ctk.CTkLabel(self.master_frame, text="Model", font=self.font_header).grid(row=0, column=0, rowspan=2, sticky="nsew", padx=1, pady=2)
+            ctk.CTkLabel(self.master_frame, text="Item Code", font=self.font_header).grid(row=0, column=0, rowspan=2, sticky="nsew", padx=1, pady=2)
             current_col_idx, col_idx_map = 1, {}
             for d in display_cols:
                 date_obj = d.date()
@@ -1625,7 +1756,7 @@ class ProductionPlannerApp(ctk.CTk):
                             current_col_idx += 1
             
             for r, row_data in df_display.iterrows():
-                row_idx, model = r + 2, row_data['Model']
+                row_idx, model = r + 2, row_data['Item Code']
                 bg_color = "#D6EAF8" if model in self.processor.highlight_models else "#FFFFFF"
                 lbl_model = ctk.CTkLabel(self.master_frame, text=model, fg_color=bg_color, font=self.font_normal, anchor="w", padx=5)
                 lbl_model.grid(row=row_idx, column=0, sticky="ew")
@@ -1873,6 +2004,29 @@ class ProductionPlannerApp(ctk.CTk):
             messagebox.showinfo("저장 완료", "최소 재고 설정이 저장되었습니다. '설정 저장 및 재계산'으로 계획에 반영하세요.")
             if self.current_step >=2:
                 self.recalculate_with_fixed_values()
+
+    def open_item_order_dialog(self):
+        if self.processor.item_master_df is None:
+            messagebox.showwarning("오류", "먼저 생산계획을 불러와야 품목 정보를 설정할 수 있습니다.")
+            return
+        
+        current_order = self.processor.item_master_df.index.tolist()
+        highlight_set = set(self.processor.highlight_models)
+        
+        dialog = ItemOrderDialog(self, item_list=current_order, highlight_items=highlight_set)
+        self.wait_window(dialog)
+        
+        if dialog.result:
+            new_order = dialog.result
+            self.processor.item_master_df = self.processor.item_master_df.reindex(new_order)
+            self.processor.item_master_df['Priority'] = range(1, len(self.processor.item_master_df) + 1)
+            self.processor.save_item_master()
+            
+            self.processor._load_item_master()
+            
+            messagebox.showinfo("저장 완료", "새로운 품목 순서가 Item.csv에 저장되었습니다.")
+            
+            self.filter_grid()
 
 if __name__ == "__main__":
     try:
