@@ -1,9 +1,9 @@
 {
     "PALLET_SIZE": 60,
-    "LEAD_TIME_DAYS": 2,
+    "LEAD_TIME_DAYS": 1,
     "PALLETS_PER_TRUCK": 36,
-    "MAX_TRUCKS_PER_DAY": 3,
-    "FONT_SIZE": 21,
+    "MAX_TRUCKS_PER_DAY": 2,
+    "FONT_SIZE": 28,
     "DELIVERY_DAYS": {
         "0": "True",
         "1": "True",
@@ -14,5 +14,12 @@
         "6": "False"
     },
     "NON_SHIPPING_DATES": [],
-    "DAILY_TRUCK_OVERRIDES": {}
+    "DAILY_TRUCK_OVERRIDES": {
+        "2025-09-18": 3,
+        "2025-09-22": 3,
+        "2025-09-26": 3
+    },
+    "APPEARANCE_MODE": "Light",
+    "AUTO_SAVE_PATH": "C:\\Users\\repla\\Downloads",
+    "DAILY_PALLET_OVERRIDES": {}
 }
