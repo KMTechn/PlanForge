@@ -443,7 +443,57 @@ class PlanProcessor:
         multipliers = self.item_master_df['Demand_Multiplier']
         demand_df = demand_df.multiply(multipliers, axis='index').astype(int)
 
-        rolling_demand = demand_df.T.rolling(window=lead_time + 1, min_periods=1).sum().T
+        # --- 선제적 수요 조절 로직 (역방향 패스) ---
+        leveled_demand_df = demand_df.copy()
+        pallet_size = self.config.get('PALLET_SIZE', 60)
+
+        if len(simulation_dates) > 1:
+            for i in range(len(simulation_dates) - 2, -1, -1):
+                current_date = simulation_dates[i]
+                next_date = simulation_dates[i+1]
+
+                is_shipping_day_next = self.config['DELIVERY_DAYS'].get(str(next_date.weekday()), 'False') == 'True'
+                is_non_shipping_date_next = next_date.date() in self.config['NON_SHIPPING_DATES']
+
+                if not is_shipping_day_next or is_non_shipping_date_next:
+                    leveled_demand_df[current_date] += leveled_demand_df[next_date]
+                    leveled_demand_df[next_date] = 0
+                    continue
+
+                daily_max_trucks_next = self.config.get('DAILY_TRUCK_OVERRIDES', {}).get(next_date.date(), self.config.get('MAX_TRUCKS_PER_DAY', 2))
+                default_pallets_per_truck_next = self.config.get('PALLETS_PER_TRUCK', 36)
+                pallets_per_truck_next = self.config.get('DAILY_PALLET_OVERRIDES', {}).get(next_date.date(), default_pallets_per_truck_next)
+                capacity_pallets_next_day = daily_max_trucks_next * pallets_per_truck_next
+
+                required_pallets_next_day = np.ceil(leveled_demand_df[next_date] / pallet_size).where(leveled_demand_df[next_date] > 0, 0)
+
+                if required_pallets_next_day.sum() > capacity_pallets_next_day:
+                    shortfall_pallets = required_pallets_next_day.sum() - capacity_pallets_next_day
+
+                    items_to_pull = required_pallets_next_day.sort_values(ascending=False).index
+                    pulled_pallets_count = 0
+
+                    for model in items_to_pull:
+                        if pulled_pallets_count >= shortfall_pallets:
+                            break
+
+                        pallets_for_model = required_pallets_next_day.loc[model]
+                        if pallets_for_model <= 0: continue
+
+                        pallets_to_pull = min(pallets_for_model, shortfall_pallets - pulled_pallets_count)
+
+                        if pallets_to_pull > 0:
+                            qty_to_pull = int(pallets_to_pull * pallet_size)
+
+                            leveled_demand_df.loc[model, current_date] += qty_to_pull
+                            leveled_demand_df.loc[model, next_date] -= qty_to_pull
+
+                            pulled_pallets_count += pallets_to_pull
+
+                    leveled_demand_df[next_date] = leveled_demand_df[next_date].clip(lower=0)
+        # --- 로직 종료 ---
+
+        rolling_demand = leveled_demand_df.T.rolling(window=lead_time + 1, min_periods=1).sum().T
         
         inventory_over_time = pd.DataFrame(index=plan_df.index, columns=simulation_dates, dtype=np.int64)
         shipments_by_truck = {}
@@ -474,7 +524,7 @@ class PlanProcessor:
                 must_ship_demand = pd.concat([required_for_lead_time, fixed_reqs_today], axis=1).max(axis=1).astype(np.int64)
 
                 all_future_dates = [d for d in simulation_dates if d > date]
-                pull_forward_demand = demand_df[all_future_dates].sum(axis=1).clip(lower=0) if all_future_dates else pd.Series(0, index=plan_df.index)
+                pull_forward_demand = leveled_demand_df[all_future_dates].sum(axis=1).clip(lower=0) if all_future_dates else pd.Series(0, index=plan_df.index)
 
                 priority_models = self.item_master_df.sort_values('Priority').index
                 
