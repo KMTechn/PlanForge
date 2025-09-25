@@ -520,17 +520,22 @@ class PlanProcessor:
                                 pull_forward_demand.loc[model] -= qty_to_ship
                                 remaining_pallet_slots -= num_pallets_to_load
                     
-                    # STEP 4: 기존 자투리 팔레트 효율화 (Topping Off) - 미래 재고 없어도 임의로 채움
+                    # STEP 4: 기존 자투리 팔레트 효율화 (Topping Off) - 미래 수요가 있을 경우에만
                     items_on_this_truck = shipments_by_truck[truck_num][date]
                     partial_pallet_items = items_on_this_truck[(items_on_this_truck > 0) & (items_on_this_truck % pallet_size != 0)]
-                    
+
                     for model, current_qty in partial_pallet_items.items():
                         space_on_pallet = pallet_size - (current_qty % pallet_size)
+                        if space_on_pallet <= 0: continue
                         
-                        if space_on_pallet > 0:
-                            qty_to_add = space_on_pallet
+                        # 미래 수요가 있는 만큼만 채운다
+                        future_demand_for_item = pull_forward_demand.get(model, 0)
+                        if future_demand_for_item > 0:
+                            qty_to_add = min(space_on_pallet, future_demand_for_item)
+
                             shipments_by_truck[truck_num].loc[model, date] += qty_to_add
                             total_shipments_today.loc[model] += qty_to_add
+                            pull_forward_demand.loc[model] -= qty_to_add
                             
                             key = (date.date(), truck_num, model)
                             self.optimized_additions[key] = self.optimized_additions.get(key, 0) + qty_to_add
