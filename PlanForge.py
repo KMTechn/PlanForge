@@ -44,7 +44,7 @@ def resource_path(relative_path):
 # ===================================================================
 REPO_OWNER = "KMTechn"
 REPO_NAME = "PlanForge"
-CURRENT_VERSION = "v1.1.6" 
+CURRENT_VERSION = "v1.0.1" 
 
 def check_for_updates(repo_owner: str, repo_name: str, current_version: str):
     logging.info("Checking for updates...")
